@@ -727,6 +727,8 @@ def main():
         parser.error(str(error))
     # The second warmup reaches DUST's credit-memory read path. Keep the original default's single update.
     warmup_updates_per_shape = 2 if args.context_schedule is not None else 1
+    memory_scope = ('PyTorch CUDA allocator peaks since process start through final validation, including '
+                    'discarded warmup; sampled before metadata aggregation. Excludes non-PyTorch allocations.')
     if rank == 0:
         if args.output.exists() and any(args.output.iterdir()):
             raise FileExistsError(f'Choose an empty output directory: {args.output}')
@@ -734,8 +736,14 @@ def main():
         (args.output / 'config.json').write_text(json.dumps(dict(
             script=__file__, world=world, batch=BATCH, steps=steps, seed=SEED,
             recipe=asdict(settings), torch_version=torch.__version__,
+            cuda_version=torch.version.cuda,
+            visible_gpus=[dict(cuda_index=index, name=torch.cuda.get_device_name(index),
+                               capability=list(torch.cuda.get_device_capability(index)),
+                               total_memory_bytes=torch.cuda.get_device_properties(index).total_memory)
+                          for index in range(torch.cuda.device_count())],
             context_schedule=[dict(start_step=start, context_length=length) for start, length in context_schedule],
             predictions_per_update=BATCH * 2048, warmup_updates_per_shape=warmup_updates_per_shape,
+            memory_scope=memory_scope,
         ), indent=2) + '\n')
 
     def init():
@@ -791,10 +799,21 @@ def main():
     estimator.close()
     state = {k: v.detach().cpu() for k, v in model.state_dict().items()}
     val_loss = evaluate(state, args.data_dir)
+    torch.cuda.synchronize(device)
+    peak_memory = torch.tensor([torch.cuda.max_memory_allocated(device), torch.cuda.max_memory_reserved(device)],
+                               device=device, dtype=torch.int64)
+    if world > 1:
+        rank_peaks = [torch.empty_like(peak_memory) for _ in range(world)]
+        torch.distributed.all_gather(rank_peaks, peak_memory)
+    else:
+        rank_peaks = [peak_memory]
     if rank == 0:
         torch.save(state, args.output / 'final.pt')
         result = dict(val_loss=val_loss, train_seconds=round(elapsed, 2), steps=step,
-                      tokens=step * BATCH * 2048, preparation_seconds=round(preparation_seconds, 2))
+                      tokens=step * BATCH * 2048, preparation_seconds=round(preparation_seconds, 2),
+                      memory_scope=memory_scope,
+                      peak_memory_by_rank=[dict(rank=index, allocated_bytes=peak[0], reserved_bytes=peak[1])
+                                           for index, peak in enumerate(p.tolist() for p in rank_peaks)])
         (args.output / 'result.json').write_text(json.dumps(result, indent=2) + '\n')
         print(json.dumps(result), flush=True)
     if world > 1:
