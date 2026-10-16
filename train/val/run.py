@@ -38,6 +38,37 @@ BATCH = 8  # sequences per update; 610 updates per epoch
 SEED = 0
 
 
+def parse_context_schedule(spec, steps):
+    """One-based stage starts; every stage keeps all 8 * 2048 prediction positions."""
+    if spec is None:
+        return [(1, 2048)]
+    try:
+        stages = [tuple(map(int, stage.split(':'))) for stage in spec.split(',')]
+    except ValueError as error:
+        raise ValueError('Context schedule must be comma-separated step:length pairs.') from error
+    if any(len(stage) != 2 for stage in stages):
+        raise ValueError('Context schedule must be comma-separated step:length pairs.')
+    if stages[0][0] != 1 or stages[-1][0] > steps or stages[-1][1] != 2048:
+        raise ValueError('Context schedule must start at step 1 and reach length 2048 within the run.')
+    if any(length <= 0 or 2048 % length for _, length in stages):
+        raise ValueError('Every context length must be a positive divisor of 2048.')
+    if any(step <= prev_step or length <= prev_length
+           for (prev_step, prev_length), (step, length) in zip(stages, stages[1:])):
+        raise ValueError('Context schedule steps and lengths must strictly increase.')
+    return stages
+
+
+def context_at_step(schedule, step):
+    return next(length for start, length in reversed(schedule) if start <= step)
+
+
+def context_batch(rows, length):
+    """Split input/target pairs together: retain even each segment's final next-token target."""
+    x = rows[:, :-1].contiguous().reshape(-1, length)
+    y = rows[:, 1:].contiguous().reshape(-1, length)
+    return x, y
+
+
 @dataclass
 class Recipe:
     """Draws per update, summed over GPUs; lists are per block."""
@@ -666,6 +697,9 @@ def main():
     parser.add_argument('--anvil-lr', type=float, help='Override the recipe\'s ANVIL II learning rate.')
     parser.add_argument('--steps', type=int, help='Stop after this many updates (smoke tests).')
     parser.add_argument('--eval-every', type=int, default=0, help='Untimed validation every this many updates.')
+    parser.add_argument('--context-schedule', help='One-based step:length stages, e.g. '
+                        '1:64,62:128,123:256,184:512,245:1024,306:2048. '
+                        'Keeps 16384 predictions per update; validation always uses length 2048.')
     args = parser.parse_args()
 
     if not torch.cuda.is_available():
@@ -687,6 +721,12 @@ def main():
     training = load_rows(args.data_dir / 'train.pt', TRAIN_ROWS)
     training = training[torch.randperm(len(training), generator=torch.Generator().manual_seed(SEED + 1))]
     steps = min(len(training) // BATCH, args.steps or len(training))
+    try:
+        context_schedule = parse_context_schedule(args.context_schedule, steps)
+    except ValueError as error:
+        parser.error(str(error))
+    # The second warmup reaches DUST's credit-memory read path. Keep the original default's single update.
+    warmup_updates_per_shape = 2 if args.context_schedule is not None else 1
     if rank == 0:
         if args.output.exists() and any(args.output.iterdir()):
             raise FileExistsError(f'Choose an empty output directory: {args.output}')
@@ -694,6 +734,8 @@ def main():
         (args.output / 'config.json').write_text(json.dumps(dict(
             script=__file__, world=world, batch=BATCH, steps=steps, seed=SEED,
             recipe=asdict(settings), torch_version=torch.__version__,
+            context_schedule=[dict(start_step=start, context_length=length) for start, length in context_schedule],
+            predictions_per_update=BATCH * 2048, warmup_updates_per_shape=warmup_updates_per_shape,
         ), indent=2) + '\n')
 
     def init():
@@ -706,25 +748,38 @@ def main():
             group.setdefault('initial_lr', group['lr'])
             group['lr'] = group['initial_lr'] * min(1.0, left / settings.warmdown if settings.warmdown else 1.0)
 
-    # untimed warmup on random tokens, then rebuild from the seed
+    # Untimed warmup for each stage's shape, then discard all model/optimizer/DUST state and reset the seed.
+    preparation_start = time.perf_counter()
     model, optimizer, estimator = init()
     noise = torch.randint(0, 4096, (BATCH, 2049), generator=torch.Generator().manual_seed(SEED)).to(device)
-    estimator.step(noise[:, :-1].contiguous(), noise[:, 1:].contiguous(), optimizer)
+    for _, length in context_schedule:
+        x, y = context_batch(noise, length)
+        for _ in range(warmup_updates_per_shape):
+            estimator.step(x, y, optimizer)
     estimator.close()
     model, optimizer, estimator = init()
+    torch.cuda.synchronize()
+    preparation_seconds = time.perf_counter() - preparation_start
 
     if rank == 0:
         print(f'val: {steps} steps, recipe={asdict(settings)}, GPUs={world}', flush=True)
+        print(json.dumps(dict(preparation_seconds=round(preparation_seconds, 2),
+                              warmup_updates_per_shape=warmup_updates_per_shape,
+                              warmup_context_lengths=[length for _, length in context_schedule])), flush=True)
     log = (args.output / 'metrics.jsonl').open('a') if rank == 0 else None
     torch.cuda.synchronize()
     start, paused, elapsed = time.perf_counter(), 0.0, 0.0
     for step in range(1, steps + 1):
         batch = training[(step - 1) * BATCH:step * BATCH].to(device)
+        context_length = context_at_step(context_schedule, step)
         set_rate(optimizer, step)
-        loss = estimator.step(batch[:, :-1].contiguous(), batch[:, 1:].contiguous(), optimizer)
+        x, y = context_batch(batch, context_length)
+        loss = estimator.step(x, y, optimizer)
         torch.cuda.synchronize()
         elapsed = time.perf_counter() - start - paused
-        record = dict(step=step, train_loss=loss, train_seconds=round(elapsed, 2))
+        record = dict(step=step, train_loss=loss, train_seconds=round(elapsed, 2),
+                      context_length=context_length, predictions=BATCH * 2048,
+                      cumulative_tokens=step * BATCH * 2048)
         if args.eval_every and step % args.eval_every == 0 and step < steps:
             pause = time.perf_counter()
             record['val_loss'] = evaluate(model.state_dict(), args.data_dir)
@@ -739,7 +794,7 @@ def main():
     if rank == 0:
         torch.save(state, args.output / 'final.pt')
         result = dict(val_loss=val_loss, train_seconds=round(elapsed, 2), steps=step,
-                      tokens=step * BATCH * 2048)
+                      tokens=step * BATCH * 2048, preparation_seconds=round(preparation_seconds, 2))
         (args.output / 'result.json').write_text(json.dumps(result, indent=2) + '\n')
         print(json.dumps(result), flush=True)
     if world > 1:
