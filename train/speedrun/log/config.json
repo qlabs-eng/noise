@@ -1,5 +1,5 @@
 {
-  "script": "/home/ubuntu/noise-scaling/src/train/speedrun/run.py",
+  "script": "/workspace/noise/train/speedrun/run.py",
   "world": 8,
   "batch": 8,
   "steps": 610,

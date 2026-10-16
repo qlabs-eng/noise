@@ -155,6 +155,15 @@ def hadamard(d, device, dtype):
     return HADAMARDS[d, device, dtype]
 
 
+@torch.compile(fullgraph=True, dynamic=False)
+def construct_probes(hadamard, patterns, offset, index, signs, fp32):
+    """Fuse the deterministic lookup, sign products, and optional output conversion."""
+    width = hadamard.shape[0]
+    rows = (offset.unsqueeze(0) + index[:, None, None]) % width
+    probes = hadamard[rows] * patterns[index // width][:, None, None, :] * signs
+    return probes.float() if fp32 else probes
+
+
 def average_ranks(tensor):
     if torch.distributed.is_initialized():
         torch.distributed.all_reduce(tensor, op=torch.distributed.ReduceOp.SUM)
@@ -236,9 +245,11 @@ class DUST:
                                  torch.randint(0, d, (b, t), device=self.device, generator=self.shared_generator))
         patterns, offset = self.frames[site]
         index = self.rank * draws + chunk * n + torch.arange(n, device=self.device)
-        rows = (offset.unsqueeze(0) + index[:, None, None]) % d  # (n, b, t)
-        a = hadamard(d, self.device, self.dtype)[rows] * patterns[index // d][:, None, None, :] * self.signs(n, b, t, 1)
-        return a if dtype in (None, self.dtype) else a.to(dtype)
+        matrix = hadamard(d, self.device, self.dtype)
+        signs = self.signs(n, b, t, 1)  # Keep random sampling outside the compiled helper.
+        if dtype not in (None, self.dtype, torch.float32):
+            raise ValueError(f'Unsupported output dtype for the 5k recipe: {dtype}')
+        return construct_probes(matrix, patterns, offset, index, signs, dtype == torch.float32)
 
     def losses(self, x, y):
         with self.autocast():
@@ -738,9 +749,10 @@ def main():
 
     estimator.close()
     state = {k: v.detach().cpu() for k, v in model.state_dict().items()}
-    val_loss = evaluate(state, args.data_dir)
     if rank == 0:
         torch.save(state, args.output / 'final.pt')
+    val_loss = evaluate(state, args.data_dir)
+    if rank == 0:
         result = dict(val_loss=val_loss, train_seconds=round(elapsed, 2), steps=step,
                       tokens=step * BATCH * 2048, reached_target=val_loss <= TARGET)
         (args.output / 'result.json').write_text(json.dumps(result, indent=2) + '\n')

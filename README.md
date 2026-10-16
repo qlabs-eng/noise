@@ -79,6 +79,7 @@ to `logs/`. `uv run utils/eval.py logs/val/final.pt` rescores a checkpoint.
 | - | - | - | - | - |
 | 1 | 4.167 | Dust w/ Adam, 24k population, lr cooldown | 1 h 46 min | - |
 | 2 | 4.180 | Track 1 record at 5k population | 22 min | [@JaydenTeoh](https://github.com/JaydenTeoh), [@Lazarus-931](https://github.com/Lazarus-931), [@serdardoesml](https://github.com/serdardoesml) |
+| 3 | 4.184 | Compile the probe construction | 21 min | [@pculaf](https://github.com/pculaf) |
 
 ## What backprop gets
 
