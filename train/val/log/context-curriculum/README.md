@@ -15,6 +15,8 @@ uv run torchrun --standalone --nproc_per_node=8 train/val/run.py \
   --eval-every 61
 ```
 
+For the exact recorded B300 dependency environment and command, see [runtime/README.md](runtime/README.md). The root `uv run` example above uses the normal upstream environment.
+
 Measurements used Python 3.12, PyTorch 2.10.0+cu130 and 8 NVIDIA B300 GPUs. The upstream environment uses cu128 and its record track specifies 8 H100 GPUs. These are B300 measurements for reproduction review, not an official H100 record. Warmup and validation are excluded from training seconds. Complete runtime hardware and allocator-peak metadata remain in the original config/result files.
 
 The completed seed-0 baseline predates the mask-construction hoist needed to compile short contexts. It therefore has a different compiler boundary from the curricula; this comparison does not isolate scheduling from compiler effects. Both curricula use the same compiler path. Two additional seed1/2 baseline/fast pairs are running with identical code within each pair; their outcomes are not yet available and are not included in these files. No timing speedup is claimed.
