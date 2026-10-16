@@ -1,0 +1,50 @@
+{
+  "val_loss": 3.959812460576787,
+  "train_seconds": 4485.82,
+  "steps": 610,
+  "tokens": 9994240,
+  "preparation_seconds": 106.64,
+  "memory_scope": "PyTorch CUDA allocator peaks since process start through final validation, including discarded warmup; sampled before metadata aggregation. Excludes non-PyTorch allocations.",
+  "peak_memory_by_rank": [
+    {
+      "rank": 0,
+      "allocated_bytes": 17056535040,
+      "reserved_bytes": 22160605184
+    },
+    {
+      "rank": 1,
+      "allocated_bytes": 17056535040,
+      "reserved_bytes": 22160605184
+    },
+    {
+      "rank": 2,
+      "allocated_bytes": 17056535040,
+      "reserved_bytes": 22160605184
+    },
+    {
+      "rank": 3,
+      "allocated_bytes": 17056535040,
+      "reserved_bytes": 22160605184
+    },
+    {
+      "rank": 4,
+      "allocated_bytes": 17056535040,
+      "reserved_bytes": 22160605184
+    },
+    {
+      "rank": 5,
+      "allocated_bytes": 17056535040,
+      "reserved_bytes": 22160605184
+    },
+    {
+      "rank": 6,
+      "allocated_bytes": 17056535040,
+      "reserved_bytes": 22160605184
+    },
+    {
+      "rank": 7,
+      "allocated_bytes": 17056535040,
+      "reserved_bytes": 22160605184
+    }
+  ]
+}

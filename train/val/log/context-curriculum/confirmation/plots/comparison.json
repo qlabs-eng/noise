@@ -1,0 +1,708 @@
+{
+  "generated_at_utc": "2026-10-16T22:33:09.853995+00:00",
+  "run_root": "/Users/huyang/Documents/ChatGPT/B300-xinchen/noise/runs/confirmation",
+  "hardware": "8 x NVIDIA B300",
+  "frozen_decision": {
+    "frozen_after_three_seed0_endpoints_utc": "2026-10-16T20:08:17.236561+00:00",
+    "insight": "Both predeclared curricula retain about1% lower final CE, while their different early trajectories converge. The completed baseline uses a different compiler boundary, so same-code confirmation is necessary.",
+    "hypothesis": "The fast curriculum lowers fixed610 validation CE relative to constant2048 under identical compiler/code and paired initialization/draw/data-order seeds.",
+    "selected_candidate": "fast",
+    "schedule": "1:64,33:128,65:256,97:512,129:1024,161:2048",
+    "selection": "Lower fixed610 seed0 CE among the two predeclared curricula; difference0.0024613212 is not a significance claim. No checkpoint selection or new schedule.",
+    "seeds": [
+      1,
+      2
+    ],
+    "runs": [
+      "seed1/baseline",
+      "seed1/candidate",
+      "seed2/baseline",
+      "seed2/candidate"
+    ],
+    "updates_per_run": 610,
+    "prediction_tokens_per_run": 9994240,
+    "source_commit": "bf2b434",
+    "row_shuffle": "seed+1 identically within each pair",
+    "comparison": "Every arm uses the same mask-hoisted block_forward code; baseline also explicit context-schedule1:2048 with prescribed two warmup updates.",
+    "decision": "Both paired endpoint CE differences<0 support consistency under identical compilation. Mixed/reversed results do not establish robustness; report all results and do not automatically sweep schedules/seeds/LR.",
+    "limits": "Only two additional paired seeds; no significance or H100 record claim, and no decomposition of the original seed0 compiler contribution.",
+    "status": "frozen; not yet GPU-started",
+    "runner": "noise/run_paired_confirmation_b300.sh"
+  },
+  "protocol": {
+    "final_step": 610,
+    "final_prediction_tokens": 9994240,
+    "validation_context_length": 2048,
+    "validation_prediction_tokens": 1114112,
+    "checkpoint_selection": false,
+    "seeds": [
+      1,
+      2
+    ],
+    "scope": "Same-code confirmation plan, paired initialization/draw/data-order seeds. Compiler metadata is reported separately; no significance or H100 record claim."
+  },
+  "pairs": {
+    "seed1": {
+      "seed": 1,
+      "status": "complete",
+      "runs": {
+        "baseline": {
+          "arm": "baseline",
+          "status": "complete",
+          "config": {
+            "script": "/dev/shm/noise-b300/code/train/val/run.py",
+            "world": 8,
+            "batch": 8,
+            "steps": 610,
+            "seed": 1,
+            "recipe": {
+              "writers": [
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256
+              ],
+              "hidden": [
+                512,
+                512,
+                512,
+                512,
+                512,
+                512,
+                512,
+                512
+              ],
+              "hubs": [
+                512,
+                512,
+                512,
+                512,
+                512,
+                512,
+                512,
+                512
+              ],
+              "embedding": 2048,
+              "local": {
+                "q": 384,
+                "v": 384,
+                "gate": 128,
+                "k": 1664,
+                "ve": 4608
+              },
+              "nrep": 16,
+              "lr": 0.003,
+              "betas": [
+                0.7,
+                0.95
+              ],
+              "warmdown": 0.3,
+              "gamma": 0.98,
+              "first_gamma": 0.3,
+              "anvil_lr": 0.023,
+              "anvil_wd": 2.25,
+              "memory_beta": 0.9,
+              "mesa_ridge": 0.1,
+              "alpha_beta": 0.8
+            },
+            "torch_version": "2.10.0+cu130",
+            "cuda_version": "13.0",
+            "block_forward_compilation": "default fusion; original window_mask constructed outside compiled block_forward",
+            "visible_gpus": [
+              {
+                "cuda_index": 0,
+                "name": "NVIDIA B300 SXM6 AC",
+                "capability": [
+                  10,
+                  3
+                ],
+                "total_memory_bytes": 287421038592
+              },
+              {
+                "cuda_index": 1,
+                "name": "NVIDIA B300 SXM6 AC",
+                "capability": [
+                  10,
+                  3
+                ],
+                "total_memory_bytes": 287421038592
+              },
+              {
+                "cuda_index": 2,
+                "name": "NVIDIA B300 SXM6 AC",
+                "capability": [
+                  10,
+                  3
+                ],
+                "total_memory_bytes": 287421038592
+              },
+              {
+                "cuda_index": 3,
+                "name": "NVIDIA B300 SXM6 AC",
+                "capability": [
+                  10,
+                  3
+                ],
+                "total_memory_bytes": 287421038592
+              },
+              {
+                "cuda_index": 4,
+                "name": "NVIDIA B300 SXM6 AC",
+                "capability": [
+                  10,
+                  3
+                ],
+                "total_memory_bytes": 287421038592
+              },
+              {
+                "cuda_index": 5,
+                "name": "NVIDIA B300 SXM6 AC",
+                "capability": [
+                  10,
+                  3
+                ],
+                "total_memory_bytes": 287421038592
+              },
+              {
+                "cuda_index": 6,
+                "name": "NVIDIA B300 SXM6 AC",
+                "capability": [
+                  10,
+                  3
+                ],
+                "total_memory_bytes": 287421038592
+              },
+              {
+                "cuda_index": 7,
+                "name": "NVIDIA B300 SXM6 AC",
+                "capability": [
+                  10,
+                  3
+                ],
+                "total_memory_bytes": 287421038592
+              }
+            ],
+            "context_schedule": [
+              {
+                "start_step": 1,
+                "context_length": 2048
+              }
+            ],
+            "predictions_per_update": 16384,
+            "warmup_updates_per_shape": 2,
+            "memory_scope": "PyTorch CUDA allocator peaks since process start through final validation, including discarded warmup; sampled before metadata aggregation. Excludes non-PyTorch allocations."
+          },
+          "last_logged_step": 610,
+          "validation": [
+            {
+              "step": 61,
+              "prediction_tokens": 999424,
+              "val_loss": 5.290042743963354,
+              "source": "metrics.jsonl"
+            },
+            {
+              "step": 122,
+              "prediction_tokens": 1998848,
+              "val_loss": 4.955989543129416,
+              "source": "metrics.jsonl"
+            },
+            {
+              "step": 183,
+              "prediction_tokens": 2998272,
+              "val_loss": 4.715576434836668,
+              "source": "metrics.jsonl"
+            },
+            {
+              "step": 244,
+              "prediction_tokens": 3997696,
+              "val_loss": 4.56897301533643,
+              "source": "metrics.jsonl"
+            },
+            {
+              "step": 305,
+              "prediction_tokens": 4997120,
+              "val_loss": 4.436785901294035,
+              "source": "metrics.jsonl"
+            },
+            {
+              "step": 366,
+              "prediction_tokens": 5996544,
+              "val_loss": 4.348448329112109,
+              "source": "metrics.jsonl"
+            },
+            {
+              "step": 427,
+              "prediction_tokens": 6995968,
+              "val_loss": 4.294735280906453,
+              "source": "metrics.jsonl"
+            },
+            {
+              "step": 488,
+              "prediction_tokens": 7995392,
+              "val_loss": 4.1638809162027695,
+              "source": "metrics.jsonl"
+            },
+            {
+              "step": 549,
+              "prediction_tokens": 8994816,
+              "val_loss": 4.065764974145329,
+              "source": "metrics.jsonl"
+            },
+            {
+              "step": 610,
+              "prediction_tokens": 9994240,
+              "val_loss": 4.01596332823529,
+              "source": "result.json"
+            }
+          ],
+          "final": {
+            "step": 610,
+            "prediction_tokens": 9994240,
+            "val_loss": 4.01596332823529,
+            "source": "result.json"
+          }
+        },
+        "candidate": {
+          "arm": "candidate",
+          "status": "complete",
+          "config": {
+            "script": "/dev/shm/noise-b300/code/train/val/run.py",
+            "world": 8,
+            "batch": 8,
+            "steps": 610,
+            "seed": 1,
+            "recipe": {
+              "writers": [
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256
+              ],
+              "hidden": [
+                512,
+                512,
+                512,
+                512,
+                512,
+                512,
+                512,
+                512
+              ],
+              "hubs": [
+                512,
+                512,
+                512,
+                512,
+                512,
+                512,
+                512,
+                512
+              ],
+              "embedding": 2048,
+              "local": {
+                "q": 384,
+                "v": 384,
+                "gate": 128,
+                "k": 1664,
+                "ve": 4608
+              },
+              "nrep": 16,
+              "lr": 0.003,
+              "betas": [
+                0.7,
+                0.95
+              ],
+              "warmdown": 0.3,
+              "gamma": 0.98,
+              "first_gamma": 0.3,
+              "anvil_lr": 0.023,
+              "anvil_wd": 2.25,
+              "memory_beta": 0.9,
+              "mesa_ridge": 0.1,
+              "alpha_beta": 0.8
+            },
+            "torch_version": "2.10.0+cu130",
+            "cuda_version": "13.0",
+            "block_forward_compilation": "default fusion; original window_mask constructed outside compiled block_forward",
+            "visible_gpus": [
+              {
+                "cuda_index": 0,
+                "name": "NVIDIA B300 SXM6 AC",
+                "capability": [
+                  10,
+                  3
+                ],
+                "total_memory_bytes": 287421038592
+              },
+              {
+                "cuda_index": 1,
+                "name": "NVIDIA B300 SXM6 AC",
+                "capability": [
+                  10,
+                  3
+                ],
+                "total_memory_bytes": 287421038592
+              },
+              {
+                "cuda_index": 2,
+                "name": "NVIDIA B300 SXM6 AC",
+                "capability": [
+                  10,
+                  3
+                ],
+                "total_memory_bytes": 287421038592
+              },
+              {
+                "cuda_index": 3,
+                "name": "NVIDIA B300 SXM6 AC",
+                "capability": [
+                  10,
+                  3
+                ],
+                "total_memory_bytes": 287421038592
+              },
+              {
+                "cuda_index": 4,
+                "name": "NVIDIA B300 SXM6 AC",
+                "capability": [
+                  10,
+                  3
+                ],
+                "total_memory_bytes": 287421038592
+              },
+              {
+                "cuda_index": 5,
+                "name": "NVIDIA B300 SXM6 AC",
+                "capability": [
+                  10,
+                  3
+                ],
+                "total_memory_bytes": 287421038592
+              },
+              {
+                "cuda_index": 6,
+                "name": "NVIDIA B300 SXM6 AC",
+                "capability": [
+                  10,
+                  3
+                ],
+                "total_memory_bytes": 287421038592
+              },
+              {
+                "cuda_index": 7,
+                "name": "NVIDIA B300 SXM6 AC",
+                "capability": [
+                  10,
+                  3
+                ],
+                "total_memory_bytes": 287421038592
+              }
+            ],
+            "context_schedule": [
+              {
+                "start_step": 1,
+                "context_length": 64
+              },
+              {
+                "start_step": 33,
+                "context_length": 128
+              },
+              {
+                "start_step": 65,
+                "context_length": 256
+              },
+              {
+                "start_step": 97,
+                "context_length": 512
+              },
+              {
+                "start_step": 129,
+                "context_length": 1024
+              },
+              {
+                "start_step": 161,
+                "context_length": 2048
+              }
+            ],
+            "predictions_per_update": 16384,
+            "warmup_updates_per_shape": 2,
+            "memory_scope": "PyTorch CUDA allocator peaks since process start through final validation, including discarded warmup; sampled before metadata aggregation. Excludes non-PyTorch allocations."
+          },
+          "last_logged_step": 610,
+          "validation": [
+            {
+              "step": 61,
+              "prediction_tokens": 999424,
+              "val_loss": 5.260267096407273,
+              "source": "metrics.jsonl"
+            },
+            {
+              "step": 122,
+              "prediction_tokens": 1998848,
+              "val_loss": 4.865185453611262,
+              "source": "metrics.jsonl"
+            },
+            {
+              "step": 183,
+              "prediction_tokens": 2998272,
+              "val_loss": 4.610483088914086,
+              "source": "metrics.jsonl"
+            },
+            {
+              "step": 244,
+              "prediction_tokens": 3997696,
+              "val_loss": 4.4981028788229995,
+              "source": "metrics.jsonl"
+            },
+            {
+              "step": 305,
+              "prediction_tokens": 4997120,
+              "val_loss": 4.367148735943963,
+              "source": "metrics.jsonl"
+            },
+            {
+              "step": 366,
+              "prediction_tokens": 5996544,
+              "val_loss": 4.281444156871123,
+              "source": "metrics.jsonl"
+            },
+            {
+              "step": 427,
+              "prediction_tokens": 6995968,
+              "val_loss": 4.220315842067494,
+              "source": "metrics.jsonl"
+            },
+            {
+              "step": 488,
+              "prediction_tokens": 7995392,
+              "val_loss": 4.1085195331012505,
+              "source": "metrics.jsonl"
+            },
+            {
+              "step": 549,
+              "prediction_tokens": 8994816,
+              "val_loss": 4.010638624429703,
+              "source": "metrics.jsonl"
+            },
+            {
+              "step": 610,
+              "prediction_tokens": 9994240,
+              "val_loss": 3.959812460576787,
+              "source": "result.json"
+            }
+          ],
+          "final": {
+            "step": 610,
+            "prediction_tokens": 9994240,
+            "val_loss": 3.959812460576787,
+            "source": "result.json"
+          }
+        }
+      },
+      "recorded_seeds": {
+        "baseline": 1,
+        "candidate": 1
+      },
+      "block_forward_compilation_by_arm": {
+        "baseline": "default fusion; original window_mask constructed outside compiled block_forward",
+        "candidate": "default fusion; original window_mask constructed outside compiled block_forward"
+      },
+      "compiler_metadata_status": "matched"
+    },
+    "seed2": {
+      "seed": 2,
+      "status": "pending_fixed_endpoints",
+      "runs": {
+        "baseline": {
+          "arm": "baseline",
+          "status": "configured",
+          "config": {
+            "script": "/dev/shm/noise-b300/code/train/val/run.py",
+            "world": 8,
+            "batch": 8,
+            "steps": 610,
+            "seed": 2,
+            "recipe": {
+              "writers": [
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256
+              ],
+              "hidden": [
+                512,
+                512,
+                512,
+                512,
+                512,
+                512,
+                512,
+                512
+              ],
+              "hubs": [
+                512,
+                512,
+                512,
+                512,
+                512,
+                512,
+                512,
+                512
+              ],
+              "embedding": 2048,
+              "local": {
+                "q": 384,
+                "v": 384,
+                "gate": 128,
+                "k": 1664,
+                "ve": 4608
+              },
+              "nrep": 16,
+              "lr": 0.003,
+              "betas": [
+                0.7,
+                0.95
+              ],
+              "warmdown": 0.3,
+              "gamma": 0.98,
+              "first_gamma": 0.3,
+              "anvil_lr": 0.023,
+              "anvil_wd": 2.25,
+              "memory_beta": 0.9,
+              "mesa_ridge": 0.1,
+              "alpha_beta": 0.8
+            },
+            "torch_version": "2.10.0+cu130",
+            "cuda_version": "13.0",
+            "block_forward_compilation": "default fusion; original window_mask constructed outside compiled block_forward",
+            "visible_gpus": [
+              {
+                "cuda_index": 0,
+                "name": "NVIDIA B300 SXM6 AC",
+                "capability": [
+                  10,
+                  3
+                ],
+                "total_memory_bytes": 287421038592
+              },
+              {
+                "cuda_index": 1,
+                "name": "NVIDIA B300 SXM6 AC",
+                "capability": [
+                  10,
+                  3
+                ],
+                "total_memory_bytes": 287421038592
+              },
+              {
+                "cuda_index": 2,
+                "name": "NVIDIA B300 SXM6 AC",
+                "capability": [
+                  10,
+                  3
+                ],
+                "total_memory_bytes": 287421038592
+              },
+              {
+                "cuda_index": 3,
+                "name": "NVIDIA B300 SXM6 AC",
+                "capability": [
+                  10,
+                  3
+                ],
+                "total_memory_bytes": 287421038592
+              },
+              {
+                "cuda_index": 4,
+                "name": "NVIDIA B300 SXM6 AC",
+                "capability": [
+                  10,
+                  3
+                ],
+                "total_memory_bytes": 287421038592
+              },
+              {
+                "cuda_index": 5,
+                "name": "NVIDIA B300 SXM6 AC",
+                "capability": [
+                  10,
+                  3
+                ],
+                "total_memory_bytes": 287421038592
+              },
+              {
+                "cuda_index": 6,
+                "name": "NVIDIA B300 SXM6 AC",
+                "capability": [
+                  10,
+                  3
+                ],
+                "total_memory_bytes": 287421038592
+              },
+              {
+                "cuda_index": 7,
+                "name": "NVIDIA B300 SXM6 AC",
+                "capability": [
+                  10,
+                  3
+                ],
+                "total_memory_bytes": 287421038592
+              }
+            ],
+            "context_schedule": [
+              {
+                "start_step": 1,
+                "context_length": 2048
+              }
+            ],
+            "predictions_per_update": 16384,
+            "warmup_updates_per_shape": 2,
+            "memory_scope": "PyTorch CUDA allocator peaks since process start through final validation, including discarded warmup; sampled before metadata aggregation. Excludes non-PyTorch allocations."
+          },
+          "last_logged_step": null,
+          "validation": [],
+          "final": null
+        },
+        "candidate": {
+          "arm": "candidate",
+          "status": "pending",
+          "config": null,
+          "last_logged_step": null,
+          "validation": [],
+          "final": null
+        }
+      },
+      "recorded_seeds": {
+        "baseline": 2,
+        "candidate": null
+      },
+      "block_forward_compilation_by_arm": {
+        "baseline": "default fusion; original window_mask constructed outside compiled block_forward",
+        "candidate": null
+      },
+      "compiler_metadata_status": "awaiting_both_configs"
+    }
+  },
+  "completed_pair_comparisons": {
+    "seed1": {
+      "seed": 1,
+      "baseline_val_loss": 4.01596332823529,
+      "candidate_val_loss": 3.959812460576787,
+      "candidate_minus_baseline_val_loss": -0.05615086765850297,
+      "relative_val_loss_reduction_percent": 1.3981917430301087,
+      "compiler_metadata_status": "matched"
+    }
+  }
+}

@@ -19,6 +19,15 @@ For the exact recorded B300 dependency environment and command, see [runtime/REA
 
 Measurements used Python 3.12, PyTorch 2.10.0+cu130 and 8 NVIDIA B300 GPUs. The upstream environment uses cu128 and its record track specifies 8 H100 GPUs. These are B300 measurements for reproduction review, not an official H100 record. Warmup and validation are excluded from training seconds. Complete runtime hardware and allocator-peak metadata remain in the original config/result files.
 
-The completed seed-0 baseline predates the mask-construction hoist needed to compile short contexts. It therefore has a different compiler boundary from the curricula; this comparison does not isolate scheduling from compiler effects. Both curricula use the same compiler path. Two additional seed1/2 baseline/fast pairs are running with identical code within each pair; their outcomes are not yet available and are not included in these files. No timing speedup is claimed.
+The completed seed-0 baseline predates the mask-construction hoist needed to compile short contexts. It therefore has a different compiler boundary from the curricula; this comparison does not isolate scheduling from compiler effects. Both curricula use the same compiler path. Auxiliary seed-1/2 baseline/fast pairs use identical mask-hoisted code, initialization/draw seed, and data order within each pair.
+
+The first pair (seed 1) is complete. Both runs reached 610 updates and 9,994,240 predictions with exit 0:
+
+| Seed-1 confirmation | Final validation CE | B300 training seconds |
+| --- | ---: | ---: |
+| Baseline, constant 2048 | 4.01596332823529 | 3493.98 |
+| Frozen fast curriculum | 3.959812460576787 | 4485.82 |
+
+Fast has **1.3982% lower CE** in this same-code pair, while taking longer. This supports an improvement for seed 1 with the compiler boundary held fixed; it does not decompose the original seed-0 difference. Seed 2 remains pending. The auxiliary seeds do not replace the seed-0 submission files in `../`, establish statistical significance, or constitute an H100 record. No timing speedup is claimed.
 
 The default invocation still runs constant 2048 at this preparation stage; use the explicit command above for this result. Source change and logs are prepared locally; no upstream PR has been submitted yet.
