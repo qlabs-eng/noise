@@ -28,6 +28,10 @@ The first pair (seed 1) is complete. Both runs reached 610 updates and 9,994,240
 | Baseline, constant 2048 | 4.01596332823529 | 3493.98 |
 | Frozen fast curriculum | 3.959812460576787 | 4485.82 |
 
-Fast has **1.3982% lower CE** in this same-code pair, while taking longer. This supports an improvement for seed 1 with the compiler boundary held fixed; it does not decompose the original seed-0 difference. Seed 2 remains pending. The auxiliary seeds do not replace the seed-0 submission files in `../`, establish statistical significance, or constitute an H100 record. No timing speedup is claimed.
+Fast has **1.3982% lower CE** in this same-code pair, while taking longer. This supports an improvement for seed 1 with the compiler boundary held fixed; it does not decompose the original seed-0 difference.
+
+The seed-2 baseline also completed 610 updates and 9,994,240 predictions with exit 0: final CE **4.0188431284006905**, training **3494.89 seconds**, and a separately recorded **31.66-second** warmup excluded from training time. Its paired fast candidate is running; final CE and training time are **PENDING**, so no seed-2 paired gain is asserted.
+
+The auxiliary seeds do not replace the seed-0 submission files in `../`, establish statistical significance, or constitute an H100 record. No timing speedup is claimed.
 
 The default invocation still runs constant 2048 at this preparation stage; use the explicit command above for this result. Source change and logs are prepared locally; no upstream PR has been submitted yet.

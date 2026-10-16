@@ -1,5 +1,5 @@
 {
-  "generated_at_utc": "2026-10-16T22:33:09.853995+00:00",
+  "generated_at_utc": "2026-10-16T23:38:21.728569+00:00",
   "run_root": "/Users/huyang/Documents/ChatGPT/B300-xinchen/noise/runs/confirmation",
   "hardware": "8 x NVIDIA B300",
   "frozen_decision": {
@@ -523,7 +523,7 @@
       "runs": {
         "baseline": {
           "arm": "baseline",
-          "status": "configured",
+          "status": "complete",
           "config": {
             "script": "/dev/shm/noise-b300/code/train/val/run.py",
             "world": 8,
@@ -671,28 +671,267 @@
             "warmup_updates_per_shape": 2,
             "memory_scope": "PyTorch CUDA allocator peaks since process start through final validation, including discarded warmup; sampled before metadata aggregation. Excludes non-PyTorch allocations."
           },
-          "last_logged_step": null,
-          "validation": [],
-          "final": null
+          "last_logged_step": 610,
+          "validation": [
+            {
+              "step": 61,
+              "prediction_tokens": 999424,
+              "val_loss": 5.282329980064841,
+              "source": "metrics.jsonl"
+            },
+            {
+              "step": 122,
+              "prediction_tokens": 1998848,
+              "val_loss": 4.971940899596495,
+              "source": "metrics.jsonl"
+            },
+            {
+              "step": 183,
+              "prediction_tokens": 2998272,
+              "val_loss": 4.73959932607763,
+              "source": "metrics.jsonl"
+            },
+            {
+              "step": 244,
+              "prediction_tokens": 3997696,
+              "val_loss": 4.5939171033747055,
+              "source": "metrics.jsonl"
+            },
+            {
+              "step": 305,
+              "prediction_tokens": 4997120,
+              "val_loss": 4.459267234101015,
+              "source": "metrics.jsonl"
+            },
+            {
+              "step": 366,
+              "prediction_tokens": 5996544,
+              "val_loss": 4.362114709966323,
+              "source": "metrics.jsonl"
+            },
+            {
+              "step": 427,
+              "prediction_tokens": 6995968,
+              "val_loss": 4.288597047328949,
+              "source": "metrics.jsonl"
+            },
+            {
+              "step": 488,
+              "prediction_tokens": 7995392,
+              "val_loss": 4.17666226976058,
+              "source": "metrics.jsonl"
+            },
+            {
+              "step": 549,
+              "prediction_tokens": 8994816,
+              "val_loss": 4.073022916036494,
+              "source": "metrics.jsonl"
+            },
+            {
+              "step": 610,
+              "prediction_tokens": 9994240,
+              "val_loss": 4.0188431284006905,
+              "source": "result.json"
+            }
+          ],
+          "final": {
+            "step": 610,
+            "prediction_tokens": 9994240,
+            "val_loss": 4.0188431284006905,
+            "source": "result.json"
+          }
         },
         "candidate": {
           "arm": "candidate",
-          "status": "pending",
-          "config": null,
-          "last_logged_step": null,
-          "validation": [],
+          "status": "partial",
+          "config": {
+            "script": "/dev/shm/noise-b300/code/train/val/run.py",
+            "world": 8,
+            "batch": 8,
+            "steps": 610,
+            "seed": 2,
+            "recipe": {
+              "writers": [
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256,
+                256
+              ],
+              "hidden": [
+                512,
+                512,
+                512,
+                512,
+                512,
+                512,
+                512,
+                512
+              ],
+              "hubs": [
+                512,
+                512,
+                512,
+                512,
+                512,
+                512,
+                512,
+                512
+              ],
+              "embedding": 2048,
+              "local": {
+                "q": 384,
+                "v": 384,
+                "gate": 128,
+                "k": 1664,
+                "ve": 4608
+              },
+              "nrep": 16,
+              "lr": 0.003,
+              "betas": [
+                0.7,
+                0.95
+              ],
+              "warmdown": 0.3,
+              "gamma": 0.98,
+              "first_gamma": 0.3,
+              "anvil_lr": 0.023,
+              "anvil_wd": 2.25,
+              "memory_beta": 0.9,
+              "mesa_ridge": 0.1,
+              "alpha_beta": 0.8
+            },
+            "torch_version": "2.10.0+cu130",
+            "cuda_version": "13.0",
+            "block_forward_compilation": "default fusion; original window_mask constructed outside compiled block_forward",
+            "visible_gpus": [
+              {
+                "cuda_index": 0,
+                "name": "NVIDIA B300 SXM6 AC",
+                "capability": [
+                  10,
+                  3
+                ],
+                "total_memory_bytes": 287421038592
+              },
+              {
+                "cuda_index": 1,
+                "name": "NVIDIA B300 SXM6 AC",
+                "capability": [
+                  10,
+                  3
+                ],
+                "total_memory_bytes": 287421038592
+              },
+              {
+                "cuda_index": 2,
+                "name": "NVIDIA B300 SXM6 AC",
+                "capability": [
+                  10,
+                  3
+                ],
+                "total_memory_bytes": 287421038592
+              },
+              {
+                "cuda_index": 3,
+                "name": "NVIDIA B300 SXM6 AC",
+                "capability": [
+                  10,
+                  3
+                ],
+                "total_memory_bytes": 287421038592
+              },
+              {
+                "cuda_index": 4,
+                "name": "NVIDIA B300 SXM6 AC",
+                "capability": [
+                  10,
+                  3
+                ],
+                "total_memory_bytes": 287421038592
+              },
+              {
+                "cuda_index": 5,
+                "name": "NVIDIA B300 SXM6 AC",
+                "capability": [
+                  10,
+                  3
+                ],
+                "total_memory_bytes": 287421038592
+              },
+              {
+                "cuda_index": 6,
+                "name": "NVIDIA B300 SXM6 AC",
+                "capability": [
+                  10,
+                  3
+                ],
+                "total_memory_bytes": 287421038592
+              },
+              {
+                "cuda_index": 7,
+                "name": "NVIDIA B300 SXM6 AC",
+                "capability": [
+                  10,
+                  3
+                ],
+                "total_memory_bytes": 287421038592
+              }
+            ],
+            "context_schedule": [
+              {
+                "start_step": 1,
+                "context_length": 64
+              },
+              {
+                "start_step": 33,
+                "context_length": 128
+              },
+              {
+                "start_step": 65,
+                "context_length": 256
+              },
+              {
+                "start_step": 97,
+                "context_length": 512
+              },
+              {
+                "start_step": 129,
+                "context_length": 1024
+              },
+              {
+                "start_step": 161,
+                "context_length": 2048
+              }
+            ],
+            "predictions_per_update": 16384,
+            "warmup_updates_per_shape": 2,
+            "memory_scope": "PyTorch CUDA allocator peaks since process start through final validation, including discarded warmup; sampled before metadata aggregation. Excludes non-PyTorch allocations."
+          },
+          "last_logged_step": 64,
+          "validation": [
+            {
+              "step": 61,
+              "prediction_tokens": 999424,
+              "val_loss": 5.260096564012415,
+              "source": "metrics.jsonl"
+            }
+          ],
           "final": null
         }
       },
       "recorded_seeds": {
         "baseline": 2,
-        "candidate": null
+        "candidate": 2
       },
       "block_forward_compilation_by_arm": {
         "baseline": "default fusion; original window_mask constructed outside compiled block_forward",
-        "candidate": null
+        "candidate": "default fusion; original window_mask constructed outside compiled block_forward"
       },
-      "compiler_metadata_status": "awaiting_both_configs"
+      "compiler_metadata_status": "matched"
     }
   },
   "completed_pair_comparisons": {
