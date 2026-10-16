@@ -31,7 +31,7 @@ from torch.nn import functional as F
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from utils.eval import evaluate
-from utils.model import GPT, GPTConfig, attention, apply_rotary_emb, has_ve, norm
+from utils.model import GPT, GPTConfig, attention, apply_rotary_emb, flex, has_ve, norm, window_mask
 from utils.prepare_data import TRAIN_ROWS, load_rows
 
 BATCH = 8  # sequences per update; 610 updates per epoch
@@ -131,7 +131,7 @@ torch._dynamo.config.cache_size_limit = 64
 
 
 @torch.compile
-def block_forward(x, w, ve, cos, sin, window, o=None, attn=None, fc=None, mlp=None):
+def block_forward(x, w, ve, cos, sin, mask, o=None, attn=None, fc=None, mlp=None):
     """Block.forward with optional jitter at o, attn, fc or mlp."""
     add = lambda t, jitter: t if jitter is None else t + jitter
     B, T, C = x.shape
@@ -142,7 +142,8 @@ def block_forward(x, w, ve, cos, sin, window, o=None, attn=None, fc=None, mlp=No
         gate = 2 * torch.sigmoid(F.linear(h[..., :w['gate'].shape[1]], w['gate']))
         v = v + gate.unsqueeze(-1) * ve.view_as(v)
     q, k = norm(apply_rotary_emb(q, cos, sin)), norm(apply_rotary_emb(k, cos, sin))
-    y = add(attention(q, k, v, window).reshape(B, T, C), o)
+    attended = flex(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=mask).transpose(1, 2)
+    y = add(attended.reshape(B, T, C), o)
     x = x + add(F.linear(y, w['proj']), attn)
     hidden = add(F.linear(norm(x), w['fc']), fc)
     return x + add(F.linear(F.relu(hidden).square(), w['out']), mlp)
@@ -299,8 +300,10 @@ class DUST:
                     x = model.resid_lambdas[i] * x + model.x0_lambdas[i] * x0
                 ve = self.outputs.get(f'value_embeds.{i}')
                 sites = {key: jitter.get(site.format(i)) for key, site in SITES.items()} if i == entry else {}
+                # Keep sparse-mask construction outside Inductor: its short-context reductions fail in 2.10.
+                mask = window_mask(model.window_sizes[i][0], length, x.device)
                 x = block_forward(x, self.weights[i], None if ve is None else ve.repeat(n, 1, 1), cos, sin,
-                                  model.window_sizes[i][0], **sites)
+                                  mask, **sites)
             # The final norm, head and loss in float32. A draw moves a token's loss by about 1e-2, while bfloat16
             # logits (soft-capped at 15) round by up to about 6e-2, differently in every draw: in the deeper blocks
             # the rounding was most of the reward's variance. The clean loss's own rounding is common to all draws.
@@ -737,6 +740,7 @@ def main():
             script=__file__, world=world, batch=BATCH, steps=steps, seed=SEED,
             recipe=asdict(settings), torch_version=torch.__version__,
             cuda_version=torch.version.cuda,
+            block_forward_compilation='default fusion; original window_mask constructed outside compiled block_forward',
             visible_gpus=[dict(cuda_index=index, name=torch.cuda.get_device_name(index),
                                capability=list(torch.cuda.get_device_capability(index)),
                                total_memory_bytes=torch.cuda.get_device_properties(index).total_memory)
