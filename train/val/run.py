@@ -694,6 +694,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--data-dir', type=Path, default=Path('data'))
     parser.add_argument('--output', type=Path, default=Path('logs/val'))
+    parser.add_argument('--seed', type=int, default=SEED, help='Seed for initialization, DUST, warmup and row order (seed + 1).')
     parser.add_argument('--scale', type=float, help='Scale every draw count of the 16k Adam cell instead.')
     parser.add_argument('--warmdown', type=float, help='Override the recipe\'s warmdown fraction.')
     parser.add_argument('--lr', type=float, help='Override the recipe\'s Adam learning rate.')
@@ -722,7 +723,7 @@ def main():
         settings.anvil_lr = args.anvil_lr
 
     training = load_rows(args.data_dir / 'train.pt', TRAIN_ROWS)
-    training = training[torch.randperm(len(training), generator=torch.Generator().manual_seed(SEED + 1))]
+    training = training[torch.randperm(len(training), generator=torch.Generator().manual_seed(args.seed + 1))]
     steps = min(len(training) // BATCH, args.steps or len(training))
     try:
         context_schedule = parse_context_schedule(args.context_schedule, steps)
@@ -737,7 +738,7 @@ def main():
             raise FileExistsError(f'Choose an empty output directory: {args.output}')
         args.output.mkdir(parents=True, exist_ok=True)
         (args.output / 'config.json').write_text(json.dumps(dict(
-            script=__file__, world=world, batch=BATCH, steps=steps, seed=SEED,
+            script=__file__, world=world, batch=BATCH, steps=steps, seed=args.seed,
             recipe=asdict(settings), torch_version=torch.__version__,
             cuda_version=torch.version.cuda,
             block_forward_compilation='default fusion; original window_mask constructed outside compiled block_forward',
@@ -751,8 +752,8 @@ def main():
         ), indent=2) + '\n')
 
     def init():
-        model = make_model(device, SEED)
-        return model, make_optimizer(model, settings, steps), DUST(model, settings, SEED, rank, world)
+        model = make_model(device, args.seed)
+        return model, make_optimizer(model, settings, steps), DUST(model, settings, args.seed, rank, world)
 
     def set_rate(optimizer, step):
         left = (steps - step + 1) / steps
@@ -763,7 +764,7 @@ def main():
     # Untimed warmup for each stage's shape, then discard all model/optimizer/DUST state and reset the seed.
     preparation_start = time.perf_counter()
     model, optimizer, estimator = init()
-    noise = torch.randint(0, 4096, (BATCH, 2049), generator=torch.Generator().manual_seed(SEED)).to(device)
+    noise = torch.randint(0, 4096, (BATCH, 2049), generator=torch.Generator().manual_seed(args.seed)).to(device)
     for _, length in context_schedule:
         x, y = context_batch(noise, length)
         for _ in range(warmup_updates_per_shape):
