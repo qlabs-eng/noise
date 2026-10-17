@@ -1,0 +1,86 @@
+{
+  "checkpoint": "/dev/shm/noise-b300/runs/baseline/final.pt",
+  "code": "/dev/shm/noise-b300/code",
+  "data_dir": "/dev/shm/noise-b300/data",
+  "world": 8,
+  "site": "transformer.h.3.attn.c_k.weight",
+  "parameter_shape": [
+    512,
+    512
+  ],
+  "context_lengths": [
+    64,
+    2048
+  ],
+  "replicate_seeds": [
+    100000,
+    200000,
+    300000,
+    400000
+  ],
+  "source_rows": 8,
+  "row_shuffle_seed": 1,
+  "row_selection": "First 8 rows after the official full-training-set randperm.",
+  "prediction_tokens_per_redraw": 16384,
+  "complete_dust_redraws_per_length": 4,
+  "recipe": {
+    "writers": [
+      256,
+      256,
+      256,
+      256,
+      256,
+      256,
+      256,
+      256
+    ],
+    "hidden": [
+      512,
+      512,
+      512,
+      512,
+      512,
+      512,
+      512,
+      512
+    ],
+    "hubs": [
+      512,
+      512,
+      512,
+      512,
+      512,
+      512,
+      512,
+      512
+    ],
+    "embedding": 2048,
+    "local": {
+      "q": 384,
+      "v": 384,
+      "gate": 128,
+      "k": 1664,
+      "ve": 4608
+    },
+    "nrep": 16,
+    "lr": 0.003,
+    "betas": [
+      0.7,
+      0.95
+    ],
+    "warmdown": 0.3,
+    "gamma": 0.98,
+    "first_gamma": 0.3,
+    "anvil_lr": 0.023,
+    "anvil_wd": 2.25,
+    "memory_beta": 0.9,
+    "mesa_ridge": 0.1,
+    "alpha_beta": 0.8
+  },
+  "memory": "Fresh empty DUST memory for every redraw.",
+  "weight_updates": 0,
+  "gradient_source": "Forward-only DUST parameter.grad after its global rank average.",
+  "torch_version": "2.10.0+cu130",
+  "cuda_version": "13.0",
+  "limitations": "Different context conditioning and possible estimator bias; no true gradient, unbiasedness, causal, significance or quality claim. Four redraws only."
+}

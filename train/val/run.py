@@ -31,11 +31,42 @@ from torch.nn import functional as F
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from utils.eval import evaluate
-from utils.model import GPT, GPTConfig, attention, apply_rotary_emb, has_ve, norm
+from utils.model import GPT, GPTConfig, attention, apply_rotary_emb, flex, has_ve, norm, window_mask
 from utils.prepare_data import TRAIN_ROWS, load_rows
 
 BATCH = 8  # sequences per update; 610 updates per epoch
 SEED = 0
+
+
+def parse_context_schedule(spec, steps):
+    """One-based stage starts; every stage keeps all 8 * 2048 prediction positions."""
+    if spec is None:
+        return [(1, 2048)]
+    try:
+        stages = [tuple(map(int, stage.split(':'))) for stage in spec.split(',')]
+    except ValueError as error:
+        raise ValueError('Context schedule must be comma-separated step:length pairs.') from error
+    if any(len(stage) != 2 for stage in stages):
+        raise ValueError('Context schedule must be comma-separated step:length pairs.')
+    if stages[0][0] != 1 or stages[-1][0] > steps or stages[-1][1] != 2048:
+        raise ValueError('Context schedule must start at step 1 and reach length 2048 within the run.')
+    if any(length <= 0 or 2048 % length for _, length in stages):
+        raise ValueError('Every context length must be a positive divisor of 2048.')
+    if any(step <= prev_step or length <= prev_length
+           for (prev_step, prev_length), (step, length) in zip(stages, stages[1:])):
+        raise ValueError('Context schedule steps and lengths must strictly increase.')
+    return stages
+
+
+def context_at_step(schedule, step):
+    return next(length for start, length in reversed(schedule) if start <= step)
+
+
+def context_batch(rows, length):
+    """Split input/target pairs together: retain even each segment's final next-token target."""
+    x = rows[:, :-1].contiguous().reshape(-1, length)
+    y = rows[:, 1:].contiguous().reshape(-1, length)
+    return x, y
 
 
 @dataclass
@@ -100,7 +131,7 @@ torch._dynamo.config.cache_size_limit = 64
 
 
 @torch.compile
-def block_forward(x, w, ve, cos, sin, window, o=None, attn=None, fc=None, mlp=None):
+def block_forward(x, w, ve, cos, sin, mask, o=None, attn=None, fc=None, mlp=None):
     """Block.forward with optional jitter at o, attn, fc or mlp."""
     add = lambda t, jitter: t if jitter is None else t + jitter
     B, T, C = x.shape
@@ -111,7 +142,8 @@ def block_forward(x, w, ve, cos, sin, window, o=None, attn=None, fc=None, mlp=No
         gate = 2 * torch.sigmoid(F.linear(h[..., :w['gate'].shape[1]], w['gate']))
         v = v + gate.unsqueeze(-1) * ve.view_as(v)
     q, k = norm(apply_rotary_emb(q, cos, sin)), norm(apply_rotary_emb(k, cos, sin))
-    y = add(attention(q, k, v, window).reshape(B, T, C), o)
+    attended = flex(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=mask).transpose(1, 2)
+    y = add(attended.reshape(B, T, C), o)
     x = x + add(F.linear(y, w['proj']), attn)
     hidden = add(F.linear(norm(x), w['fc']), fc)
     return x + add(F.linear(F.relu(hidden).square(), w['out']), mlp)
@@ -268,8 +300,10 @@ class DUST:
                     x = model.resid_lambdas[i] * x + model.x0_lambdas[i] * x0
                 ve = self.outputs.get(f'value_embeds.{i}')
                 sites = {key: jitter.get(site.format(i)) for key, site in SITES.items()} if i == entry else {}
+                # Keep sparse-mask construction outside Inductor: its short-context reductions fail in 2.10.
+                mask = window_mask(model.window_sizes[i][0], length, x.device)
                 x = block_forward(x, self.weights[i], None if ve is None else ve.repeat(n, 1, 1), cos, sin,
-                                  model.window_sizes[i][0], **sites)
+                                  mask, **sites)
             # The final norm, head and loss in float32. A draw moves a token's loss by about 1e-2, while bfloat16
             # logits (soft-capped at 15) round by up to about 6e-2, differently in every draw: in the deeper blocks
             # the rounding was most of the reward's variance. The clean loss's own rounding is common to all draws.
@@ -660,12 +694,16 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--data-dir', type=Path, default=Path('data'))
     parser.add_argument('--output', type=Path, default=Path('logs/val'))
+    parser.add_argument('--seed', type=int, default=SEED, help='Seed for initialization, DUST, warmup and row order (seed + 1).')
     parser.add_argument('--scale', type=float, help='Scale every draw count of the 16k Adam cell instead.')
     parser.add_argument('--warmdown', type=float, help='Override the recipe\'s warmdown fraction.')
     parser.add_argument('--lr', type=float, help='Override the recipe\'s Adam learning rate.')
     parser.add_argument('--anvil-lr', type=float, help='Override the recipe\'s ANVIL II learning rate.')
     parser.add_argument('--steps', type=int, help='Stop after this many updates (smoke tests).')
-    parser.add_argument('--eval-every', type=int, default=0, help='Untimed validation every this many updates.')
+    parser.add_argument('--eval-every', type=int, default=61, help='Untimed validation every this many updates.')
+    parser.add_argument('--context-schedule', default='1:64,33:128,65:256,97:512,129:1024,161:2048', help='One-based step:length stages, e.g. '
+                        '1:64,62:128,123:256,184:512,245:1024,306:2048. '
+                        'Keeps 16384 predictions per update; validation always uses length 2048.')
     args = parser.parse_args()
 
     if not torch.cuda.is_available():
@@ -685,20 +723,37 @@ def main():
         settings.anvil_lr = args.anvil_lr
 
     training = load_rows(args.data_dir / 'train.pt', TRAIN_ROWS)
-    training = training[torch.randperm(len(training), generator=torch.Generator().manual_seed(SEED + 1))]
+    training = training[torch.randperm(len(training), generator=torch.Generator().manual_seed(args.seed + 1))]
     steps = min(len(training) // BATCH, args.steps or len(training))
+    try:
+        context_schedule = parse_context_schedule(args.context_schedule, steps)
+    except ValueError as error:
+        parser.error(str(error))
+    # The second warmup reaches DUST's credit-memory read path.
+    warmup_updates_per_shape = 2 if args.context_schedule is not None else 1
+    memory_scope = ('PyTorch CUDA allocator peaks since process start through final validation, including '
+                    'discarded warmup; sampled before metadata aggregation. Excludes non-PyTorch allocations.')
     if rank == 0:
         if args.output.exists() and any(args.output.iterdir()):
             raise FileExistsError(f'Choose an empty output directory: {args.output}')
         args.output.mkdir(parents=True, exist_ok=True)
         (args.output / 'config.json').write_text(json.dumps(dict(
-            script=__file__, world=world, batch=BATCH, steps=steps, seed=SEED,
+            script=__file__, world=world, batch=BATCH, steps=steps, seed=args.seed,
             recipe=asdict(settings), torch_version=torch.__version__,
+            cuda_version=torch.version.cuda,
+            block_forward_compilation='default fusion; original window_mask constructed outside compiled block_forward',
+            visible_gpus=[dict(cuda_index=index, name=torch.cuda.get_device_name(index),
+                               capability=list(torch.cuda.get_device_capability(index)),
+                               total_memory_bytes=torch.cuda.get_device_properties(index).total_memory)
+                          for index in range(torch.cuda.device_count())],
+            context_schedule=[dict(start_step=start, context_length=length) for start, length in context_schedule],
+            predictions_per_update=BATCH * 2048, warmup_updates_per_shape=warmup_updates_per_shape,
+            memory_scope=memory_scope,
         ), indent=2) + '\n')
 
     def init():
-        model = make_model(device, SEED)
-        return model, make_optimizer(model, settings, steps), DUST(model, settings, SEED, rank, world)
+        model = make_model(device, args.seed)
+        return model, make_optimizer(model, settings, steps), DUST(model, settings, args.seed, rank, world)
 
     def set_rate(optimizer, step):
         left = (steps - step + 1) / steps
@@ -706,25 +761,38 @@ def main():
             group.setdefault('initial_lr', group['lr'])
             group['lr'] = group['initial_lr'] * min(1.0, left / settings.warmdown if settings.warmdown else 1.0)
 
-    # untimed warmup on random tokens, then rebuild from the seed
+    # Untimed warmup for each stage's shape, then discard all model/optimizer/DUST state and reset the seed.
+    preparation_start = time.perf_counter()
     model, optimizer, estimator = init()
-    noise = torch.randint(0, 4096, (BATCH, 2049), generator=torch.Generator().manual_seed(SEED)).to(device)
-    estimator.step(noise[:, :-1].contiguous(), noise[:, 1:].contiguous(), optimizer)
+    noise = torch.randint(0, 4096, (BATCH, 2049), generator=torch.Generator().manual_seed(args.seed)).to(device)
+    for _, length in context_schedule:
+        x, y = context_batch(noise, length)
+        for _ in range(warmup_updates_per_shape):
+            estimator.step(x, y, optimizer)
     estimator.close()
     model, optimizer, estimator = init()
+    torch.cuda.synchronize()
+    preparation_seconds = time.perf_counter() - preparation_start
 
     if rank == 0:
         print(f'val: {steps} steps, recipe={asdict(settings)}, GPUs={world}', flush=True)
+        print(json.dumps(dict(preparation_seconds=round(preparation_seconds, 2),
+                              warmup_updates_per_shape=warmup_updates_per_shape,
+                              warmup_context_lengths=[length for _, length in context_schedule])), flush=True)
     log = (args.output / 'metrics.jsonl').open('a') if rank == 0 else None
     torch.cuda.synchronize()
     start, paused, elapsed = time.perf_counter(), 0.0, 0.0
     for step in range(1, steps + 1):
         batch = training[(step - 1) * BATCH:step * BATCH].to(device)
+        context_length = context_at_step(context_schedule, step)
         set_rate(optimizer, step)
-        loss = estimator.step(batch[:, :-1].contiguous(), batch[:, 1:].contiguous(), optimizer)
+        x, y = context_batch(batch, context_length)
+        loss = estimator.step(x, y, optimizer)
         torch.cuda.synchronize()
         elapsed = time.perf_counter() - start - paused
-        record = dict(step=step, train_loss=loss, train_seconds=round(elapsed, 2))
+        record = dict(step=step, train_loss=loss, train_seconds=round(elapsed, 2),
+                      context_length=context_length, predictions=BATCH * 2048,
+                      cumulative_tokens=step * BATCH * 2048)
         if args.eval_every and step % args.eval_every == 0 and step < steps:
             pause = time.perf_counter()
             record['val_loss'] = evaluate(model.state_dict(), args.data_dir)
@@ -736,10 +804,21 @@ def main():
     estimator.close()
     state = {k: v.detach().cpu() for k, v in model.state_dict().items()}
     val_loss = evaluate(state, args.data_dir)
+    torch.cuda.synchronize(device)
+    peak_memory = torch.tensor([torch.cuda.max_memory_allocated(device), torch.cuda.max_memory_reserved(device)],
+                               device=device, dtype=torch.int64)
+    if world > 1:
+        rank_peaks = [torch.empty_like(peak_memory) for _ in range(world)]
+        torch.distributed.all_gather(rank_peaks, peak_memory)
+    else:
+        rank_peaks = [peak_memory]
     if rank == 0:
         torch.save(state, args.output / 'final.pt')
         result = dict(val_loss=val_loss, train_seconds=round(elapsed, 2), steps=step,
-                      tokens=step * BATCH * 2048)
+                      tokens=step * BATCH * 2048, preparation_seconds=round(preparation_seconds, 2),
+                      memory_scope=memory_scope,
+                      peak_memory_by_rank=[dict(rank=index, allocated_bytes=peak[0], reserved_bytes=peak[1])
+                                           for index, peak in enumerate(p.tolist() for p in rank_peaks)])
         (args.output / 'result.json').write_text(json.dumps(result, indent=2) + '\n')
         print(json.dumps(result), flush=True)
     if world > 1:

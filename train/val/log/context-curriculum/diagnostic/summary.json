@@ -1,0 +1,107 @@
+{
+  "site": "transformer.h.3.attn.c_k.weight",
+  "by_context_length": {
+    "64": {
+      "replicates": 4,
+      "parameter_elements": 262144,
+      "mean_estimate_l2_norm": 0.015441750905250072,
+      "mean_squared_deviation_l2": 0.00010366950432152402,
+      "sample_variance_trace": 0.00013822600576203202,
+      "mean_per_coordinate_sample_variance": 5.27290366218689e-10,
+      "relative_rms_dispersion": 0.6593696732986937,
+      "relative_rms_dispersion_definition": "sqrt(mean_r ||g_r - mean(g)||_2^2) / ||mean(g)||_2",
+      "pairwise_cosines": [
+        {
+          "replicate_i": 0,
+          "replicate_j": 1,
+          "cosine": 0.5890888600165578
+        },
+        {
+          "replicate_i": 0,
+          "replicate_j": 2,
+          "cosine": 0.5912412160214998
+        },
+        {
+          "replicate_i": 0,
+          "replicate_j": 3,
+          "cosine": 0.596078424138848
+        },
+        {
+          "replicate_i": 1,
+          "replicate_j": 2,
+          "cosine": 0.5965055576410417
+        },
+        {
+          "replicate_i": 1,
+          "replicate_j": 3,
+          "cosine": 0.600695029963244
+        },
+        {
+          "replicate_i": 2,
+          "replicate_j": 3,
+          "cosine": 0.6023039813994362
+        }
+      ],
+      "mean_pairwise_cosine": 0.5959855115301046,
+      "clean_train_ce_by_replicate": [
+        4.2456746101379395,
+        4.2456746101379395,
+        4.2456746101379395,
+        4.2456746101379395
+      ],
+      "mean_clean_train_ce": 4.2456746101379395
+    },
+    "2048": {
+      "replicates": 4,
+      "parameter_elements": 262144,
+      "mean_estimate_l2_norm": 0.009126323467247066,
+      "mean_squared_deviation_l2": 7.846803602732204e-05,
+      "sample_variance_trace": 0.00010462404803642939,
+      "mean_per_coordinate_sample_variance": 3.9910906996318583e-10,
+      "relative_rms_dispersion": 0.9706229009009937,
+      "relative_rms_dispersion_definition": "sqrt(mean_r ||g_r - mean(g)||_2^2) / ||mean(g)||_2",
+      "pairwise_cosines": [
+        {
+          "replicate_i": 0,
+          "replicate_j": 1,
+          "cosine": 0.3619584178161939
+        },
+        {
+          "replicate_i": 0,
+          "replicate_j": 2,
+          "cosine": 0.3507288670062519
+        },
+        {
+          "replicate_i": 0,
+          "replicate_j": 3,
+          "cosine": 0.3522678462113616
+        },
+        {
+          "replicate_i": 1,
+          "replicate_j": 2,
+          "cosine": 0.3597303358830746
+        },
+        {
+          "replicate_i": 1,
+          "replicate_j": 3,
+          "cosine": 0.3507828485143874
+        },
+        {
+          "replicate_i": 2,
+          "replicate_j": 3,
+          "cosine": 0.34383517359149507
+        }
+      ],
+      "mean_pairwise_cosine": 0.35321724817046074,
+      "clean_train_ce_by_replicate": [
+        3.9418954849243164,
+        3.9418954849243164,
+        3.9418954849243164,
+        3.9418954849243164
+      ],
+      "mean_clean_train_ce": 3.9418954849243164
+    }
+  },
+  "optimizer_updates": 0,
+  "interpretation": "Lower relative dispersion and higher cosine at L64 would support a bounded estimator-stability observation on this checkpoint and batch, not a causal explanation of curriculum quality or a true-gradient comparison."
+}
