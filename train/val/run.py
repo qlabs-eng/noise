@@ -700,8 +700,8 @@ def main():
     parser.add_argument('--lr', type=float, help='Override the recipe\'s Adam learning rate.')
     parser.add_argument('--anvil-lr', type=float, help='Override the recipe\'s ANVIL II learning rate.')
     parser.add_argument('--steps', type=int, help='Stop after this many updates (smoke tests).')
-    parser.add_argument('--eval-every', type=int, default=0, help='Untimed validation every this many updates.')
-    parser.add_argument('--context-schedule', help='One-based step:length stages, e.g. '
+    parser.add_argument('--eval-every', type=int, default=61, help='Untimed validation every this many updates.')
+    parser.add_argument('--context-schedule', default='1:64,33:128,65:256,97:512,129:1024,161:2048', help='One-based step:length stages, e.g. '
                         '1:64,62:128,123:256,184:512,245:1024,306:2048. '
                         'Keeps 16384 predictions per update; validation always uses length 2048.')
     args = parser.parse_args()
@@ -729,7 +729,7 @@ def main():
         context_schedule = parse_context_schedule(args.context_schedule, steps)
     except ValueError as error:
         parser.error(str(error))
-    # The second warmup reaches DUST's credit-memory read path. Keep the original default's single update.
+    # The second warmup reaches DUST's credit-memory read path.
     warmup_updates_per_shape = 2 if args.context_schedule is not None else 1
     memory_scope = ('PyTorch CUDA allocator peaks since process start through final validation, including '
                     'discarded warmup; sampled before metadata aggregation. Excludes non-PyTorch allocations.')

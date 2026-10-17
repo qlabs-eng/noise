@@ -21,17 +21,19 @@ Measurements used Python 3.12, PyTorch 2.10.0+cu130 and 8 NVIDIA B300 GPUs. The 
 
 The completed seed-0 baseline predates the mask-construction hoist needed to compile short contexts. It therefore has a different compiler boundary from the curricula; this comparison does not isolate scheduling from compiler effects. Both curricula use the same compiler path. Auxiliary seed-1/2 baseline/fast pairs use identical mask-hoisted code, initialization/draw seed, and data order within each pair.
 
-The first pair (seed 1) is complete. Both runs reached 610 updates and 9,994,240 predictions with exit 0:
+Both auxiliary pairs are complete. All four runs reached 610 updates and 9,994,240 predictions with exit 0; the confirmation queue also exited 0:
 
-| Seed-1 confirmation | Final validation CE | B300 training seconds |
-| --- | ---: | ---: |
-| Baseline, constant 2048 | 4.01596332823529 | 3493.98 |
-| Frozen fast curriculum | 3.959812460576787 | 4485.82 |
+| Confirmation | Baseline final CE | Fast final CE | Relative CE reduction | Baseline / fast training seconds |
+| --- | ---: | ---: | ---: | ---: |
+| Seed 1 | 4.01596332823529 | 3.959812460576787 | 1.3982% | 3493.98 / 4485.82 |
+| Seed 2 | 4.0188431284006905 | 4.0156356920214265 | 0.0798% | 3494.89 / 4487.06 |
 
-Fast has **1.3982% lower CE** in this same-code pair, while taking longer. This supports an improvement for seed 1 with the compiler boundary held fixed; it does not decompose the original seed-0 difference.
+Both same-code pairs favor fast, but the effect varies substantially and the second gain is very small. These results do not establish a stable improvement magnitude or statistical significance, and do not decompose the original seed-0 compiler difference. Fast takes longer in both pairs.
 
-The seed-2 baseline also completed 610 updates and 9,994,240 predictions with exit 0: final CE **4.0188431284006905**, training **3494.89 seconds**, and a separately recorded **31.66-second** warmup excluded from training time. Its paired fast candidate is running; final CE and training time are **PENDING**, so no seed-2 paired gain is asserted.
+A zero-update, forward-only diagnostic at one frozen checkpoint/site/batch, with four redraws and empty credit memory, found lower relative RMS dispersion (0.659 vs 0.971) and higher directional agreement (0.596 vs 0.353) at context 64, but **higher absolute variance** (1.38226e-4 vs 1.04624e-4). Different conditioning and possible estimator bias prevent a true-gradient or causal explanation of curriculum quality.
 
 The auxiliary seeds do not replace the seed-0 submission files in `../`, establish statistical significance, or constitute an H100 record. No timing speedup is claimed.
 
-The default invocation still runs constant 2048 at this preparation stage; use the explicit command above for this result. Source change and logs are prepared locally; no upstream PR has been submitted yet.
+The default invocation now selects seed 0, the fast schedule and `eval-every=61`, equivalent to the recorded explicit command above; the remaining recipe is unchanged. For shorter smoke runs ending before update 161, pass `--context-schedule 1:2048`.
+
+[Seed-0 full-validation curves](curves.svg) · [Same-code paired-confirmation curves](confirmation/plots/confirmation.svg)

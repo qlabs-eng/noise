@@ -1,5 +1,5 @@
 {
-  "generated_at_utc": "2026-10-16T23:38:21.728569+00:00",
+  "generated_at_utc": "2026-10-17T00:47:45.954747+00:00",
   "run_root": "/Users/huyang/Documents/ChatGPT/B300-xinchen/noise/runs/confirmation",
   "hardware": "8 x NVIDIA B300",
   "frozen_decision": {
@@ -519,7 +519,7 @@
     },
     "seed2": {
       "seed": 2,
-      "status": "pending_fixed_endpoints",
+      "status": "complete",
       "runs": {
         "baseline": {
           "arm": "baseline",
@@ -743,7 +743,7 @@
         },
         "candidate": {
           "arm": "candidate",
-          "status": "partial",
+          "status": "complete",
           "config": {
             "script": "/dev/shm/noise-b300/code/train/val/run.py",
             "world": 8,
@@ -911,16 +911,75 @@
             "warmup_updates_per_shape": 2,
             "memory_scope": "PyTorch CUDA allocator peaks since process start through final validation, including discarded warmup; sampled before metadata aggregation. Excludes non-PyTorch allocations."
           },
-          "last_logged_step": 64,
+          "last_logged_step": 610,
           "validation": [
             {
               "step": 61,
               "prediction_tokens": 999424,
               "val_loss": 5.260096564012415,
               "source": "metrics.jsonl"
+            },
+            {
+              "step": 122,
+              "prediction_tokens": 1998848,
+              "val_loss": 4.885772901422837,
+              "source": "metrics.jsonl"
+            },
+            {
+              "step": 183,
+              "prediction_tokens": 2998272,
+              "val_loss": 4.6449892661150765,
+              "source": "metrics.jsonl"
+            },
+            {
+              "step": 244,
+              "prediction_tokens": 3997696,
+              "val_loss": 4.524751775404987,
+              "source": "metrics.jsonl"
+            },
+            {
+              "step": 305,
+              "prediction_tokens": 4997120,
+              "val_loss": 4.416093412567587,
+              "source": "metrics.jsonl"
+            },
+            {
+              "step": 366,
+              "prediction_tokens": 5996544,
+              "val_loss": 4.3276788837769455,
+              "source": "metrics.jsonl"
+            },
+            {
+              "step": 427,
+              "prediction_tokens": 6995968,
+              "val_loss": 4.269451541059158,
+              "source": "metrics.jsonl"
+            },
+            {
+              "step": 488,
+              "prediction_tokens": 7995392,
+              "val_loss": 4.167551941731396,
+              "source": "metrics.jsonl"
+            },
+            {
+              "step": 549,
+              "prediction_tokens": 8994816,
+              "val_loss": 4.065735031576717,
+              "source": "metrics.jsonl"
+            },
+            {
+              "step": 610,
+              "prediction_tokens": 9994240,
+              "val_loss": 4.0156356920214265,
+              "source": "result.json"
             }
           ],
-          "final": null
+          "final": {
+            "step": 610,
+            "prediction_tokens": 9994240,
+            "val_loss": 4.0156356920214265,
+            "source": "result.json"
+          }
         }
       },
       "recorded_seeds": {
@@ -941,6 +1000,14 @@
       "candidate_val_loss": 3.959812460576787,
       "candidate_minus_baseline_val_loss": -0.05615086765850297,
       "relative_val_loss_reduction_percent": 1.3981917430301087,
+      "compiler_metadata_status": "matched"
+    },
+    "seed2": {
+      "seed": 2,
+      "baseline_val_loss": 4.0188431284006905,
+      "candidate_val_loss": 4.0156356920214265,
+      "candidate_minus_baseline_val_loss": -0.003207436379264017,
+      "relative_val_loss_reduction_percent": 0.07980994223430724,
       "compiler_metadata_status": "matched"
     }
   }
