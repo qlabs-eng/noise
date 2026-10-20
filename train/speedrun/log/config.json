@@ -1,56 +1,20 @@
 {
-  "script": "/root/noise/train/speedrun/run.py",
+  "script": "train/speedrun/run.py",
+  "reference_for": "#29",
   "world": 8,
-  "batch": 8,
-  "steps": 610,
-  "schedule_steps": 610,
+  "batch": 4,
+  "steps": 975,
   "seed": 0,
-  "target": 4.2,
-  "preset": "38m",
-  "train_rows": 4880,
-  "recipe": {
-    "lr": 0.003,
-    "betas": [
-      0.7,
-      0.95
-    ],
-    "warmdown": 0.3,
-    "anvil_lr": 0.023,
-    "anvil_wd": 2.25
-  },
-  "settings": {
-    "sigma": 0.005,
-    "probes": 0,
-    "fc_k": 256,
-    "fc_sigma": 0.05,
-    "local": {
-      "q": 64,
-      "k": 320,
-      "v": 512,
-      "gate": 64
-    },
-    "nrep": 64,
-    "emb_chunk": 16,
-    "scalar_step": 0.01,
-    "chunk": 33554432,
-    "boost_exact_keys": true,
-    "chain_sigma": 0.01,
-    "route_k": 512,
-    "chain_tokens": 64,
-    "cut_exact_keys": true,
-    "key_sigma": 0.003,
-    "key_chunk": 8,
-    "fast_mlp_mode": "all",
-    "antithetic_q": false,
-    "q_sigma": 0.1,
-    "whiten": false,
-    "whiten_ema": 0.9,
-    "whiten_clip": 4.0,
-    "subspace_k": 0,
-    "subspace_ema": 0.9,
-    "no_chain": true,
-    "value_path": false,
-    "skip_mid": true
-  },
-  "torch_version": "2.10.0+cu128"
+  "seq_warmup": "1024:780",
+  "cooldown": 390,
+  "lr": 0.003,
+  "betas": [
+    0.7,
+    0.98
+  ],
+  "lr_wte": 0.9,
+  "lr_value_embeds": 0.9,
+  "lr_lambdas": 0.003,
+  "anvil_lr": 0.04,
+  "anvil_wd": 2.25
 }
