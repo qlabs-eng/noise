@@ -1,5 +1,6 @@
 {
-  "script": "/home/ubuntu/t1prs/pr40/train/val/run_scale.py",
+  "script": "/home/dev/noise-exact3-20261023/work/train/val/run.py",
+  "model_file": "/home/dev/noise-exact3-20261023/output/target30m-exact-future-01/_launch/submission/entry_model.py",
   "world": 8,
   "seed": 0,
   "recipe": {
@@ -10,7 +11,8 @@
       "n_head": 8,
       "n_kv_head": 8,
       "n_embd": 512,
-      "window_pattern": "SSSL"
+      "window_pattern": "SSSL",
+      "embedding_coefficient": 0.5
     },
     "estimator": "cut",
     "boost_hub": "projected",
@@ -53,10 +55,21 @@
     "gate_path": true,
     "gate_path_sigma": 0.01,
     "future_draws": 128,
+    "future_hidden_draws": 128,
     "future_layers": 4,
+    "future_replay_depth": 0,
+    "future_residual_correction": false,
+    "future_relay_tokens": 0,
+    "merge_normalized": false,
     "future_tokens": 128,
     "future_chunk": 512,
     "future_sigma": 0.01,
+    "future_exact": [
+      "hidden",
+      "query",
+      "wte"
+    ],
+    "future_receivers": 16,
     "query_keys": 256,
     "key_sigma": 0.003,
     "key_chunk": 32
@@ -64,7 +77,9 @@
   "steps": 3654,
   "epoch_updates": 3654,
   "train_rows": 14616,
-  "upstream": "qlabs-eng/noise@98dbf6339c7768b2a6c2b9022aa25c80eb22a259",
+  "holdout_rows": 32,
+  "diagnostic_prefix": false,
+  "upstream": "qlabs-eng/noise@b6405a155a38371f994a8f3915ea5d8a87235315",
   "additions": [
     "linear_path_scalars",
     "input_key_probes",
