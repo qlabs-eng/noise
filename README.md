@@ -83,6 +83,7 @@ to `logs/`. `uv run utils/eval.py logs/val/final.pt` rescores a checkpoint.
 | 1 | 3.767 | Dust w/ Adam, 24k population, lr cooldown | 5 h 17 min | [Script](https://github.com/qlabs-eng/noise/blob/b6405a155a38371f994a8f3915ea5d8a87235315/train/val/dust.py) | - |
 | 2 | 3.409 | 10M record #14: Boost → Cut with own queries, exact values, future-token probes and an end merge | 1 h 43 min | [Script](https://github.com/qlabs-eng/noise/blob/b6405a155a38371f994a8f3915ea5d8a87235315/train/val/run.py) | [@JaydenTeoh](https://github.com/JaydenTeoh), [@spicylemonade](https://github.com/spicylemonade), [@hoo0681](https://github.com/hoo0681), [@Lazarus-931](https://github.com/Lazarus-931), [@CharlesDDDD](https://github.com/CharlesDDDD), [@NotDesigned](https://github.com/NotDesigned) |
 | 3 | 3.338 | A forward readout of cross-token credit along each token's path; a fixed Boost, lower ANVIL II weight decay | 56 min | [Script](https://github.com/qlabs-eng/noise/blob/6f0c450ed52d52dd2fefd2a8ba485d92f2b37e92/train/val/run.py) | [@CharlesDDDD](https://github.com/CharlesDDDD) |
+| 4 | 3.300 | #3 with two-hop credit through next-token twins and a transit decode; head transplants, self-distillation, a planted previous-token head, a linear decay | 43 min | [Script](https://github.com/qlabs-eng/noise/blob/baece979a903ed960736476a7fab8ca1df43a146/train/val/run.py) | [@CharlesDDDD](https://github.com/CharlesDDDD) |
 
 ### Track 2: speedrun to 3.5 (30M)
 

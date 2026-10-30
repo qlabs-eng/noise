@@ -1,5 +1,5 @@
 {
-  "script": "/home/chunyuan/noise30_pr/train/val/run.py",
+  "script": "/tmp/claude-chunyuan/d7b/pr_full/wt/train/val/run.py",
   "world": 8,
   "seed": 0,
   "recipe": {
@@ -24,9 +24,21 @@
       0.5,
       0.98
     ],
-    "warmdown": 0.4,
+    "warmdown": 1.0,
     "final": 0.3,
     "head_std": 0.02,
+    "future_window": [
+      0.0,
+      1.0
+    ],
+    "future_families": [
+      "hidden",
+      "query",
+      "wte"
+    ],
+    "cross_alpha": 1.0,
+    "cross_alpha_layers": [],
+    "boost_head": "avg",
     "anvil_lr": 0.026,
     "anvil_wd": 0.75,
     "fast_weight": 1.0,
@@ -35,6 +47,7 @@
     "fc_sigma": 0.05,
     "query_draws": 64,
     "query_sigma": 0.1,
+    "query_central": false,
     "nrep": 64,
     "emb_chunk": 16,
     "scalar_step": 0.01,
@@ -42,26 +55,36 @@
     "chain_sigma": 0.01,
     "route_k": 512,
     "chain_tokens": 512,
+    "chain_precision": "bf16",
+    "own_query": true,
+    "value_path": true,
+    "path_scalars": true,
     "key_path_draws": 512,
     "key_path_sigma": 0.01,
+    "key_path_tokens": 64,
+    "gate_path": true,
     "gate_path_sigma": 0.01,
+    "future_draws": 128,
+    "future_layers": 4,
+    "future_tokens": 512,
+    "future_chunk": 512,
+    "future_sigma": 0.01,
     "query_keys": 256,
     "key_sigma": 0.003,
+    "key_chunk": 32,
+    "future_onesided": true,
+    "readout": true,
+    "readout_sources": true,
     "readout_q_keys": 16,
-    "readout_q_full": [
-      0
-    ],
+    "readout_q_full": [],
     "readout_fc_cycle": [
-      512,
       128,
       128,
-      128
-    ],
-    "readout_hi_fc_cycle": [
-      512,
       128,
       128
     ],
+    "readout_self": true,
+    "readout_chunk": 512,
     "readout_sigma": 0.01,
     "readout_k_blocks": [
       0,
@@ -69,35 +92,115 @@
       2,
       3
     ],
-    "readout_k_receivers": 8,
+    "readout_k_receivers": 16,
+    "readout_gate": true,
     "readout_k_cap": 1.5,
     "readout_hi_blocks": [
       4,
       5,
       6
     ],
-    "readout_in_roots": [
+    "readout_hi_out3": true,
+    "readout_in_roots": [],
+    "readout_hi_fc_cycle": [
+      128,
+      128,
+      128
+    ],
+    "readout_hi_top_root": true,
+    "readout_shared": true,
+    "distill": true,
+    "distill_lam": 0.3,
+    "distill_beta": 0.99,
+    "distill_start": 0.1,
+    "distill_until": 1.0,
+    "head_edit": true,
+    "head_edit_start": 50,
+    "head_edit_every": 25,
+    "head_edit_stop": 450,
+    "head_edit_per_block": 2,
+    "head_edit_nxfer": 5,
+    "head_edit_betas": [
+      0.5,
+      1.0,
+      1.5
+    ],
+    "head_edit_deltas": [
+      1,
+      2,
+      3
+    ],
+    "head_edit_protect": 200,
+    "twin": true,
+    "twin_consumers": "linear",
+    "twin_cap1": 6,
+    "twin_cap2": 7,
+    "twin_inputs": [
+      1
+    ],
+    "twin_kc": [
       5,
       7
     ],
-    "readout_chunk": 512
+    "twin_transport": "identity",
+    "speed_exact": true,
+    "speed_store": true,
+    "speed_lite8": true,
+    "readout_skip_blocks": [
+      5,
+      6
+    ],
+    "readout_k_select": "bound",
+    "transit": true,
+    "transit_roots": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7
+    ],
+    "transit_sigma": 0.001,
+    "transit_direct": 16,
+    "transit_dsigma": 0.001,
+    "transit_iters": 1,
+    "transit_spare": 8,
+    "transit_store": "fp32",
+    "transit_base_block": 0,
+    "transit_base_mid": true,
+    "transit_base_whiten": false,
+    "transit_whiten_mode": "lu",
+    "transit_whiten_k": 256,
+    "transit_whiten_eps": 0.01,
+    "boost_emb_block0": true,
+    "transit_inroots": true,
+    "readout_shared_pairs": true,
+    "anvil_head_polar": [
+      "q",
+      "k"
+    ],
+    "plant": {
+      "c": 0.0,
+      "prev": [
+        [
+          4,
+          0
+        ]
+      ]
+    },
+    "adam_scalar_mult": 60.0
   },
   "steps": 3654,
   "epoch_updates": 3654,
   "train_rows": 14616,
-  "upstream": "qlabs-eng/noise@3343973b6f1af119effcdea2622f1fe672c51b1e",
+  "upstream": "qlabs-eng/noise@98dbf6339c7768b2a6c2b9022aa25c80eb22a259",
   "additions": [
     "linear_path_scalars",
     "input_key_probes",
     "input_gate_probes",
-    "cut_batch4_split2",
-    "recipe_11",
-    "end_merge",
-    "true_path_readout",
-    "self_edged_chain",
-    "q_fc_source_experiments",
-    "k_gate_receiver_experiments",
-    "input_roots"
+    "independent_future_hidden_query_embedding_probes"
   ],
   "resume": null,
   "torch_version": "2.10.0+cu128"
