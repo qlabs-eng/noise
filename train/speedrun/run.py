@@ -1,32 +1,49 @@
-"""Track 2: an identity-path phase hands off to Cut; held-out training rows then select a merge of weight averages.
+"""Track 2: an identity-path phase hands off to Cut; the end weights are a fixed merge with a weight average.
 
-Builds on qlabs-eng/noise#51 (itself on #44); the kernels it calls live next to this file (visit_chain*.py,
-visit_gluon_root.py, query_factored_gluon.py, query_gluon.py, moment_kernels.py, window_topk.py, project_values.py).
+Builds on qlabs-eng/noise#52 (itself on #51 and #44); the kernels it calls live next to this file (visit_chain*.py,
+visit_gluon_root.py, query_factored_gluon.py, query_gluon.py, moment_kernels.py, *_ws.py, window_topk.py,
+project_values.py, span_solve.py).
 
-1. Identity phase: 355 updates of 8 rows of #44's 1831-update plan (#51: 300), with #29's identity-path credit
+1. Identity phase: 175 updates of 8 rows of #44's 1831-update plan (#52: 355), with #29's identity-path credit
    (full-cycle readout credit, finite MLP responses and #29's attention moments). It hands off at full rate; these
-   355 updates lie inside the plan's 368-update ANVIL momentum ramp. ANVIL updates the matrices and Adam the rest.
-   Listed under "identity" in config.json: each attn.c_proj starts as the norm-matched transpose of its c_v, and each
-   wte row starts with 1/256 of its energy in the 32 gate channels; for the first 195 updates, wte rows keep that
-   split, the value embeddings' vocabulary-common Adam motion is amplified 4x at fixed energy, the VE gates'
-   head-mean credit is pooled over the four VE layers, and each VE layer's centered Adam motion is joined by its
-   partner layer's (1-5, 3-7). Those mechanisms are exact no-ops after update 195, so a second captured graph
-   without them runs the remaining updates.
-2. Cut phase: 1468 updates of 8 of the remaining rows. Each batch takes one row from each of 8 difficulty strata:
-   rows ranked by the mean add-one-smoothed unigram surprisal of their target tokens, with the counts taken over the
-   Cut rows inside the timer. The Cut estimator:
+   175 updates lie inside the plan's 368-update ANVIL momentum ramp. ANVIL updates the matrices and Adam the rest.
+   Listed under "identity" in config.json: each attn.c_proj starts as the norm-matched transpose of its c_v; block 1's
+   heads start as lag-1 heads, their queries and keys a RoPE pair matched at lag 1 (amplitude rho^(i/2) on frequency
+   pair i, rho 0.9; #52: 0.8) read from the block's shared mean direction, on top of 0.1 of their random weights (#52:
+   0.25); each wte row starts with 1/256 of its energy in the 32 gate channels. For the first 195 updates (so the whole
+   phase), wte rows keep that split, the value embeddings' vocabulary-common Adam motion is amplified 4x at fixed
+   energy, the VE gates' head-mean credit is pooled over the four VE layers, and each VE layer's centered Adam motion
+   is joined by its partner layer's (1-5, 3-7) at gain 1.0 (#52: 0.5). One captured graph runs every update.
+2. Cut phase: 1083 updates over the remaining rows less 1.5%: the first half of the horizon (542 updates) at 8 rows per
+   update, one per GPU; the rest (541) at 16, two per GPU, whose tokens share every token-major kernel and one gradient
+   exchange and optimizer step (each row's attention credits from its own keys), with both optimizers' rates x 1.42.
+   Each stage has its own Cut and captured estimate graph. The 192 rows (1.5% of the Cut rows, rounded down to whole
+   16-row updates) whose target-token mix is furthest from the Cut rows' add-one-smoothed unigram mix (largest KL) are
+   left unused. Each run of 8 kept rows takes one row from each of 8 difficulty strata: rows ranked by the mean
+   add-one-smoothed unigram surprisal of their target tokens. Both statistics count the Cut rows' tokens inside the
+   timer, on the GPU (a side stream beside the identity phase's replays). The Cut estimator:
    - the readout probe from the second-order expansion of the softcapped log-sum-exp in the moved logits (its
      quadratic term exact over the vocabulary for every frame direction), the target logit and norm exact;
-   - two single MLP roots, at blocks 4 and 6 (#51: pairs 0-1, 2-4, 6-7): each forward replay moves its root's mid
-     stream along a full 512-direction signed Hadamard frame with random signs per token (the same on every GPU,
-     whose rows differ), through routed MLPs (each token's 64 units from block 2 on with the largest
-     |relu^2(h + r) - relu^2(h - r)| times output-weight norm, h the unit's pre-activation and r = chain_sigma times
-     its input-weight norm), to the readout, scored with diagonal readout moments. The block-4 replay also replays
-     attention at block 5 (16 strong keys per moved query, shifted by the tail centroid); its moved queries are
-     computed from the root's 64-wide routed change against each token's Wo[routes] @ W_q^T, an identity of the same
-     move. Each root's identity-path prediction (the readout credit times the residual scalars above it) is
-     subtracted from the replay and added back to that root's credit. Block 7 takes the readout credit, the other
-     blocks the next block's credit times its residual scalar;
+   - two single MLP roots, at blocks 6 and 4, measured in that order. Each forward replay moves its root's mid stream
+     by +- a per-token step (random signs, the same on every GPU, whose rows differ) through routed MLPs (each token's
+     64 units from block 2 on with the largest |relu^2(h + r) - relu^2(h - r)| times output-weight norm, h the unit's
+     pre-activation and r = chain_sigma times its input-weight norm) to the readout, scored with diagonal readout
+     moments. Each root's identity-path prediction, its control, is subtracted from the replay and added back to that
+     root's credit;
+   - root 6 replays every token, along the token's routed span instead of a frame: 128 moves, the routed c_fc rows of
+     blocks 6 and 7 (each with its block's mid stream direction removed, at a frame row's length), at 0.1 x the
+     frame's step. These are the directions the routed MLPs read a move by to first order, and they hold 99.96% of the
+     credit residual. Each token's credit is decoded from its 128 loss changes by 16 conjugate-gradient steps on the
+     ridged Gram of its rows (one Triton kernel, span_solve.py). Its control is the readout credit times the residual
+     scalars above it;
+   - root 4 replays 3/16 of each rank's tokens in the 8-row stage (384 of 2048) and 7/16 in the 16-row stage (1792 of
+     4096 over a rank's two rows), drawn by systematic sampling with probability proportional to the norm of its control
+     (0.4 of each token's probability uniform) and weighted 1 / pi. Its control is root 6's credit carried down by the
+     residual scalars of blocks 5 and 6, which the other tokens keep as their credit. Root 4 moves along a full
+     512-direction signed Hadamard frame and also replays attention at block 5 (16 strong keys per moved query, shifted
+     by the tail centroid, found for the replayed tokens only); its moved queries are computed from the root's 64-wide
+     routed change against each token's Wo[routes] @ W_q^T, an identity of the same move. Block 7 takes the readout
+     credit, blocks 5 and 0-3 the next block's credit times its residual scalar;
    - mixing scalars: each block's mid credit contracted with the scalar's two inputs, a linear step, plus #44's path
      term (the value- and gate-path input credits contracted the same way);
    - the embedding's credit: every block's mid credit summed along its x0 skip, one finite step back through the
@@ -35,26 +52,41 @@ visit_gluon_root.py, query_factored_gluon.py, query_gluon.py, moment_kernels.py,
      coordinate through the norm and RoPE (the moment model of #29's identity-phase credits); #44's value and gate
      paths (exact linear value credit; one finite norm or gate step whose credit feeds only linear consumers).
    ANVIL weight decay is zero after the first 275/1043 of the updates. Each rank updates 1/8 of every ANVIL shape
-   batch (bf16 reduce-scatter, polar step, all-gather); the other gradients are all-reduced in bf16; the collectives
-   are waited where first read.
-3. Weight averages (decays 0.03 and 0.02, every 5 updates over the last 70% of the Cut rows) are merged part by part
-   at 0.75 or 1.0, chosen on 64 held-out rows (a race over 4 keys).
+   batch (bf16 reduce-scatter, polar step, all-gather), each unit's math a CUDA graph and the later units' graphs on a
+   side stream under the first's; the other gradients are all-reduced in bf16 and AdamW steps on a side stream under
+   ANVIL's polar step; the collectives are waited where first read. The next update's gate rows are drawn on a side
+   stream during this one, and the training loss is averaged over the ranks once per flush. The query moments, key
+   scan, lse / center and value credits run as warp-specialized Gluon kernels (*_ws.py; bitwise the Triton kernels'
+   numbers), and the chain kernels with fewer instructions per row (the same numbers but the summation order of
+   visit_chain3's readout sums).
+3. One weight average (decay 0.04, every 5 updates over the last 70% of the Cut rows, on a side stream); the end
+   weights are final + 0.75 x (average - final), every weight. This fixed merge is the choice that every earlier
+   holdout race made (64 held-out rows, part by part over decays 0.04, 0.03 and 0.02 and coefficients 0.5, 0.6 and
+   0.75: always decay 0.04 at 0.75 in every part, seeds 0, 1 and 3); no rows are read for it, and the 64 held-out rows
+   are left unused (row_usage.json counts them as unused).
 
-config.json lists the changes against #44 (qlabs-eng/noise@3343973b) under "additions".
+config.json lists the changes against #44 (qlabs-eng/noise@3343973b) under "additions"; its "recipe" holds every
+setting (the defaults are this run's; --set KEY=VALUE overrides a Settings field or a module constant for screening).
 
 Run on one 8xH100 node, seed 0; measured results are in train/speedrun/log/.
 As in #44, train.pt is read (with its pinned-hash check) and split by seeded permutations, and the identity batches
-are put on the GPUs, before the timer; apart from the organizers' pinned-hash check, the difficulty order is the only
-computation on the rows' contents before the first update, and it is timed. The random-token warmup (both identity
-graphs, a throwaway Cut, the Cut-estimate graph capture and the merge scorer, whose inputs the held-out rows overwrite
-before scoring) is discarded or reset before timed training starts from seed 0; final validation is untimed.
-metrics.jsonl writes the Cut records every 16 updates, each with the time of its flush.
+are put on the GPUs, before the timer; the (unordered) Cut rows of that split are put there the same way. Apart from
+the organizers' pinned-hash check, the difficulty order and the pruning statistic are the only computation on the
+rows' contents before the first update; both read only the Cut rows' tokens and are timed. Inside the timer the
+identity phase is queued first and the Cut rows are ordered and pruned on a side stream beside its replays. The pruned
+rows feed nothing after that statistic (row_usage.json counts them, pruned_rows, among the unused rows). The
+random-token warmup (the identity graph, a throwaway Cut, the ANVIL graphs and both stages' Cut-estimate graph
+captures) is discarded or reset before timed training starts from seed 0; final validation is untimed. metrics.jsonl
+writes the identity and Cut records at the end of the run (one flush): the identity record carries the identity
+phase's own GPU time (CUDA events), the Cut records the time at the flush.
 
     uv run torchrun --standalone --nproc_per_node=8 train/speedrun/run.py
 """
 import argparse
 import ast
-from dataclasses import asdict, dataclass, field
+import bisect
+import contextlib
+from dataclasses import asdict, dataclass, field, replace
 import gc
 import hashlib
 import json
@@ -83,6 +115,7 @@ import query_factored_gluon  # noqa: E402
 import window_topk  # noqa: E402
 import project_values  # noqa: E402
 import moment_kernels  # noqa: E402
+import span_solve  # noqa: E402
 from utils.prepare_data import TRAIN_ROWS, load_rows
 from utils.eval import evaluate
 BEGIN_MARKER = 'NOISE_TRAINING_BEGIN'
@@ -108,7 +141,7 @@ def end_training() -> None:
 
 
 SEED = 0
-IDENTITY_UPDATES, IDENTITY_SCHEDULE = 355, 1831  # hand off to Cut after 355 of 1831 planned identity updates
+IDENTITY_UPDATES, IDENTITY_SCHEDULE = 175, 1831  # hand off to Cut after 175 of 1831 planned identity updates
 EPS = torch.finfo(torch.float32).eps
 HADAMARDS = {}
 torch._dynamo.config.cache_size_limit = 64
@@ -124,6 +157,13 @@ class Settings:
     model: GPTConfig = field(default_factory=model_config)
     late_cut_decay_multiplier: float = 0.0  # ANVIL weight-decay factor after the first 275/1043 of Cut updates
     cut_batch: int = 8
+    cut_rows: int = 2  # rows per rank in one estimate pass (cut_batch x cut_rows rows per update): the rows' tokens
+    # share every token-major kernel, and one gradient exchange and optimizer step serve them all (each row's attention
+    # credits from its own keys)
+    cut_rows_from: float = 0.5  # > 0 (a growing batch): the Cut updates before this share of the horizon run at
+    # cut_rows // 2 rows per rank (their own Cut and estimate graph), the rest at cut_rows; 0: cut_rows from the start
+    cut_rows_rate: float = 1.42  # both optimizers' rates x this on the updates at cut_rows rows (with cut_rows_from:
+    # those after the switch; without: all)
     lr: float = 0.0028
     betas: tuple = (0.5, 0.98)
     warmdown: float = 0.5
@@ -131,26 +171,27 @@ class Settings:
     final: float = 0.5
     anvil_lr: float = 0.036
     anvil_wd: float = 2.25
-    fast_weight: float = 1.0
+    fast_weight: float = 0.75
     polar_margin: float = 1.1
-    telemetry_batch: int = 16
+    telemetry_batch: int = 1468  # Cut records per flush (one host sync each); more than the run's updates: one flush
     fc_sigma: float = 0.05
     route_k_late: int = 64  # this many routes from block route_split on (0: route_k everywhere)
     route_split: int = 2
     query_moment_sigma: float = 0.003
     chain_sigma: float = 0.01
-    chain_depth_roots: tuple = (4, 6)
+    chain_depth_roots: tuple = (4, 6)  # root L-4 (frame moves, attention replayed at L-3), then root L-2 (routed span)
+    chain_fraction: tuple = (0.375, 1.0)  # per root: tokens replayed (a multiple of 64; the rest keep their control)
+    chain_fraction_stages: tuple = ((0.1875, 1.0), (0.4375, 1.0))  # per batch stage (row_stages): its Cut's
+    # chain_fraction; empty: chain_fraction in every stage
+    chain_pps_floor: float = 0.4  # a subsetted root's draw: probability proportional to |control| with this share of
+    # each token's probability uniform (systematic sampling, weights 1 / pi)
+    span_cg: int = 16  # root L-2's per-token decode: span_cg x K / 128 conjugate-gradient steps (K moves)
     route_k: int = 128
     chain_tokens: int = 2048
     query_replay_long_layers: tuple = (5,)
     gate_path_sigma: float = 0.01
     query_keys: int = 16
     key_sigma: float = 0.003
-    merge_screen_rows: int = 8
-    merge_screen_global: int = 16
-    merge_screen_coordinate: int = 2
-    merge_keys: int = 4
-    merge_sweeps: int = 0
     emb_scale: float = 750.0
     lambda_scale: float = 15.0
     def __post_init__(self):
@@ -160,6 +201,16 @@ class Settings:
             if not ((root == last - 1 and not replays) or (root == last - 3 and replays == (last - 2,))):
                 raise ValueError('a chain root must be block L-2 (no attention replay after it) or block L-4 with '
                                  'the attention replayed at L-3')
+        if tuple(self.chain_depth_roots) != (last - 3, last - 1) or len(self.chain_fraction) != 2:
+            raise ValueError('chain roots: block L-4, then block L-2 (whose credit is the L-4 root\'s control); '
+                             'chain_fraction: one entry per root')
+        if not (isinstance(self.cut_rows, int) and self.cut_rows >= 1 and 0 <= self.cut_rows_from < 1
+                and self.cut_rows_rate > 0 and not (self.cut_rows_from and self.cut_rows % 2) and self.span_cg >= 1):
+            raise ValueError('cut_rows: a positive int (even with cut_rows_from); cut_rows_from: in [0, 1); '
+                             'cut_rows_rate > 0; span_cg >= 1')
+        stages = self.chain_fraction_stages
+        if stages and (len(stages) != len(row_stages(self)) or any(len(f) != 2 for f in stages)):
+            raise ValueError('chain_fraction_stages: empty or one chain_fraction (one entry per root) per batch stage')
 
 
 @torch.compile
@@ -344,6 +395,11 @@ def norm_input_credit(x, g, sigma, H):
 def root_norm_inverses(x, steps, basis):
     d = x.shape[-1]
     sq = x.square().sum(-1, keepdim=True)
+    if basis.dim() == 3:  # the routed root's per-token move rows (tokens, P, width) bf16, one fused fp32 reduction
+        rows = basis.float()
+        dots = steps * (rows * x.unsqueeze(1)).sum(-1)
+        moved_sq = steps.square() * rows.square().sum(-1)
+        return torch.rsqrt(sq / d + EPS), torch.rsqrt((sq + 2 * dots + moved_sq) / d + EPS)
     dots = steps * (x @ basis.T)
     moved_sq = steps.square() * basis.square().sum(-1).unsqueeze(0)
     return torch.rsqrt(sq / d + EPS), torch.rsqrt((sq + 2 * dots + moved_sq) / d + EPS)
@@ -365,11 +421,11 @@ def query_inverses_from_output_partials(next_x, partials):
 
 def chain_chunk_eager(site, root_moves, mids, xL, idx, hs, lam_r, w_fc, w_out_t, base,
     target_logit_w, y, own, moments, root_projection, query_layers):
-    """Replay one root: its signed frame moves enter at block site, through routed MLPs, with attention replayed only
-    at query_layers. Two layouts: a root at block L-2 (root visit and readout in one kernel, visit_chain), or a root at
-    L-4 with the attention replayed at L-3 (the root's routed change feeds the factored query replay; blocks L-3 to
-    L-1 in one kernel, visit_chain3). Returns each token's moved-minus-clean loss for every move, from diagonal readout
-    moments."""
+    """Replay one root: its moves enter at block site, through routed MLPs, with attention replayed only at
+    query_layers. Two layouts: a root at block L-2 moving along each token's own routed rows (root visit and readout
+    in one kernel, visit_chain's per-token rows), or a root at L-4 moving along its signed frame with the attention
+    replayed at L-3 (the root's routed change feeds the factored query replay; blocks L-3 to L-1 in one kernel,
+    visit_chain3). Returns each token's moved-minus-clean loss for every move, from diagonal readout moments."""
     L = len(mids)
     tail = (mids[L - 1], w_fc[L - 1], w_out_t[L - 1], idx[L - 1], hs[L - 1], xL, target_logit_w,
             moments[2], moments[3], moments[4])
@@ -377,7 +433,8 @@ def chain_chunk_eager(site, root_moves, mids, xL, idx, hs, lam_r, w_fc, w_out_t,
     inv0, inv = root_norm_inverses(mids[site], *root_moves)
     if site == L - 2:
         assert not query_layers
-        terminal_stats = visit_chain.fused_root_readout_fast(*root_moves, root_projection, w_out_t[site], idx[site],
+        # each token's own move rows (tokens, P, width) and their projections on its routed c_fc rows (tokens, R, P)
+        terminal_stats = visit_chain.fused_root_readout_tokens(*root_moves, root_projection, w_out_t[site], idx[site],
             hs[site], inv0, inv, lam_r[site + 1], *tail)
     else:
         b, m = site + 1, site + 2
@@ -581,11 +638,81 @@ def _route_moment_stream_kernel(Scores, K, V, Top, Probability, OutV, OutK,
     tl.store(OutK + dest, ak.to(tl.bfloat16).to(tl.float32))
 
 
+@triton.jit
+def _route_moment_rows_kernel(Scores, K, V, Top, Pos, Probability, OutV, OutK,
+    T: tl.constexpr, R: tl.constexpr, WINDOW: tl.constexpr, KEYS: tl.constexpr,
+    BM: tl.constexpr, BN: tl.constexpr):
+    """_route_moment_stream_kernel for R query rows at sorted positions Pos (a subset's): each row sums over the
+    same absolute key blocks; blocks a row's window masks add exact zeros (the max kept finite for them)."""
+    tile, head = tl.program_id(0), tl.program_id(1)
+    qs = tile * BM + tl.arange(0, BM)
+    ds = tl.arange(0, 64)
+    ns = tl.arange(0, BN)
+    running_max = tl.full((BM,), float('-inf'), tl.float32)
+    denom = tl.zeros((BM,), tl.float32)
+    first = tl.maximum(tl.load(Pos + tile * BM).to(tl.int32) - WINDOW, 0) // BN
+    last = tl.cdiv(tl.load(Pos + tile * BM + BM - 1).to(tl.int32) + 1, BN)
+    for block in range(first, last):
+        ks = block * BN + ns
+        score = tl.load(Scores + (head * R + qs[:, None]) * T + ks[None, :]).to(tl.float32) * 0.125
+        new_max = tl.maximum(running_max, tl.max(score, 1))
+        safe = tl.where(new_max == float('-inf'), 0.0, new_max)
+        denom = denom * tl.exp(running_max-safe) + tl.sum(tl.exp(score-safe[:, None]), 1)
+        running_max = new_max
+    av = tl.zeros((BM, 64), tl.float32)
+    ak = tl.zeros((BM, 64), tl.float32)
+    for block in range(first, last):
+        ks = block * BN + ns
+        score = tl.load(Scores + (head * R + qs[:, None]) * T + ks[None, :]).to(tl.float32) * 0.125
+        prob = (tl.exp(score-running_max[:, None])/denom[:, None]).to(tl.bfloat16)
+        key = tl.load(K + (head * T + ks[:, None]) * 64 + ds[None, :])
+        val = tl.load(V + (head * T + ks[:, None]) * 64 + ds[None, :])
+        av += tl.dot(prob, val)
+        ak += tl.dot(prob, key)
+    rows = (head * R + qs[:, None]) * KEYS + tl.arange(0, KEYS)[None, :]
+    top = tl.load(Top + rows).to(tl.float32) * 0.125
+    pp = tl.exp(top-running_max[:, None])/denom[:, None]
+    tl.store(Probability + rows, pp)
+    dest = (head * R + qs[:, None]) * 64 + ds[None, :]
+    tl.store(OutV + dest, av.to(tl.bfloat16).to(tl.float32))
+    tl.store(OutK + dest, ak.to(tl.bfloat16).to(tl.float32))
+
+
+@triton.jit
+def _pps_draw_kernel(Size, Params, Offset, Pi, Index, Weight, N: tl.constexpr, COUNT: tl.constexpr,
+                     BINS: tl.constexpr, PASSES: tl.constexpr):
+    """Cut.pps_subset's draw in one program: inclusion probabilities pi (fp64) proportional to Size (a Params[0] x N
+    uniform share), capped at 1 and rescaled to sum COUNT (PASSES passes); then searchsorted(cumsum(pi), offset + j,
+    right=True) = #{i: c_i <= offset + j} = the number of tokens whose points below c_i, ceil(c_i - offset) clamped to
+    [0, COUNT], are at most j: a histogram and its running sum. Index: the COUNT drawn tokens (sorted); Weight:
+    1 / pi."""
+    tokens = tl.arange(0, N)
+    size = tl.load(Size + tokens).to(tl.float64)
+    p = tl.load(Params) + tl.load(Params + 1) * size / tl.maximum(tl.sum(size, 0), 1e-30)
+    capped = tokens < 0
+    pi = p
+    for _ in tl.static_range(PASSES):
+        left = (COUNT - tl.sum(capped.to(tl.int32), 0)).to(tl.float64)
+        pi = tl.where(capped, 1.0, p * (left / tl.sum(tl.where(capped, 0.0, p), 0)))
+        capped = pi >= 1
+    pi = tl.minimum(pi, 1.0)
+    pi = pi * (COUNT / tl.sum(pi, 0))
+    tl.store(Pi + tokens, pi)
+    below = tl.minimum(tl.maximum(tl.ceil(tl.cumsum(pi, 0) - tl.load(Offset)), 0.0), COUNT).to(tl.int32)
+    js = tl.arange(0, BINS)
+    sl = tl.minimum(tl.cumsum(tl.histogram(below, BINS), 0), N - 1)
+    tl.debug_barrier()
+    keep = js < COUNT
+    tl.store(Index + js, sl.to(tl.int64), keep)
+    tl.store(Weight + js, (1 / tl.load(Pi + sl, keep, 1.0)).to(tl.float32), keep)
+
+
 @torch.compile(dynamic=False)
-def pack_gradients(gradients, divisor, bf16: bool):
-    """Cut.step's flat gradient buffer, torch.cat(...) / divisor, and (bf16) its bf16 copy, in one compiled graph."""
+def pack_gradients(gradients, divisor):
+    """Cut.step's flat bf16 gradient buffer (the wire), torch.cat(...) / divisor cast to bf16, in one compiled graph
+    (the fp32 buffer never written)."""
     flat = torch.cat([g.float().reshape(-1) for g in gradients]) / divisor
-    return flat, flat.to(torch.bfloat16) if bf16 else flat
+    return flat.to(torch.bfloat16)
 
 
 @torch.compile(dynamic=False)
@@ -641,8 +768,8 @@ def weight_credits(chains, g_top, lam_r, extras, attn_proj_in, mlp_proj_in, fc_o
 
 @torch.compile(dynamic=False)
 def probe_moment_terms(x, y, weight, H):
-    """Cut.probe_moments: the readout credit from the second-order logit expansion (frame H drawn by the caller)
-    and the head moments."""
+    """Cut.probe_moments: the readout credit from the second-order logit expansion (frame H drawn by the caller),
+    the head moments and the logits x @ weight.T, which chain_credits reuses."""
     C = H @ weight.T
     width = x.shape[-1]
     steps = 0.005 * x.square().mean(-1, keepdim=True).sqrt().clamp(min=1e-6)
@@ -671,7 +798,7 @@ def probe_moment_terms(x, y, weight, H):
     base_y = base.gather(1, target.unsqueeze(1))
     zy = (base_y + steps * C.T[target]) * inv
     derivative = (change - (15 * torch.tanh(zy / 15) - 15 * torch.tanh(base_y * inv0 / 15))) / steps
-    return (derivative * (y >= 0).unsqueeze(1)) @ H / width, moments
+    return (derivative * (y >= 0).unsqueeze(1)) @ H / width, moments, base
 
 
 def descending_inputs_eager(raws, gates, blocks, c_vs, lam_r, x0, outs):
@@ -715,14 +842,45 @@ def chain_tail(measured, g_top, lam_r, lam_0, x0, outs):
 
 
 @torch.compile(dynamic=False)
-def group_credits(loss_change, steps, controls, frames, boost: float):
+def group_credits(loss_change, steps, controls, frames, boost):
     """Each root's credit from its replay group's loss changes: the identity-path predictions of every root removed,
-    the remainder read along the root's frame and added back to its own prediction."""
+    the remainder read along the root's frame and added back to its own prediction. boost: a float, or a subset's
+    per-token (rows, 1) weights."""
     residual = loss_change
     for step, control, frame in zip(steps, controls, frames):
         residual = residual - step * (control @ frame.T)
     return [control + boost * ((residual / step) @ frame / frame.shape[0])
             for step, control, frame in zip(steps, controls, frames)]
+
+
+@torch.compile(dynamic=False)
+def routed_frame(w_fc, idx, mids, blocks: tuple, site: int):
+    """The routed root's moves: each token's own rows (tokens, K, width) bf16 (the moves the chain kernel makes and the
+    decode reads), the routed c_fc rows a of the blocks (K = 64 per block), each with its block's mid stream direction
+    m removed and scaled to a frame row's length sqrt(width) (the lengths from the per-unit |a|^2 and a . m): the
+    directions the routed MLPs read a move by to first order, which hold the root's credit residual. Also the root's
+    routed c_fc rows on them (tokens, 64, K) fp32, the root visit's projection (bf16 GEMM, fp32 accumulation)."""
+    parts = []
+    for b in blocks:  # a - o m, o = a . m / (|m|^2 + d eps): |a - o m|^2 = |a|^2 - o (2 a . m - o |m|^2)
+        a, m = w_fc[b][idx[b]], mids[b]
+        am, mm = (a.float() * m.unsqueeze(1)).sum(-1), m.square().sum(-1, keepdim=True)
+        off = am / (mm + EPS * m.shape[-1])
+        sq = w_fc[b].float().square().sum(-1)[idx[b]] - off * (2 * am - off * mm)
+        scale = m.shape[-1] ** 0.5 * torch.rsqrt(sq.clamp_min(1e-30))
+        parts.append((scale.unsqueeze(-1) * (a.float() - off.unsqueeze(-1) * m.unsqueeze(1))).to(torch.bfloat16))
+    frame = torch.cat(parts, 1)
+    return frame, torch.bmm(w_fc[site][idx[site]], frame.transpose(1, 2), out_dtype=torch.float32)
+
+
+def span_decode(loss_change, steps, control, rows, boost, cg):
+    """The routed root's credit on its tokens: control + boost B^T (B B^T + ridge d I)^-1 r with r = loss_change /
+    step - B control, each token's credit residual solved in the span of its move rows B (tokens, K, width) bf16 (rows
+    of length sqrt(d), SPAN_RIDGE relative to the unit diagonal) by cg x K / 128 conjugate-gradient steps in one kernel
+    (span_solve). boost: a float, or a subset's per-token (tokens, 1) weights."""
+    per_token = torch.is_tensor(boost)
+    return span_solve.span_cg_decode(loss_change, steps, control, rows,
+                                     boost.reshape(-1, 1).expand(control.shape[0], 1) if per_token else None,
+                                     1.0 if per_token else float(boost), SPAN_RIDGE, cg * rows.shape[1] // 128)
 
 
 @torch.compile(dynamic=False)
@@ -765,8 +923,8 @@ def own_query_tensors(k_out, v_out, gate_out, ve_out, cos, sin, heads: int):
 @torch.compile(dynamic=False)
 def strong_key_tensors(kk, vv, idx, p, out, all_keys):
     """The top keys (shifted by the tail centroid) and values of each query, and the values' tail remainder."""
-    heads, length, width = kk.shape
-    count = idx.shape[-1]
+    heads, _, width = kk.shape
+    length, count = idx.shape[1:]  # query rows (a subset's: fewer than the keys)
     flat = idx.reshape(heads, length * count, 1).expand(-1, -1, width)
     ktop = kk.gather(1, flat).view(heads, length, count, width)
     vtop = vv.gather(1, flat).view(heads, length, count, width)
@@ -864,6 +1022,35 @@ def stream_route_moments(q, keys, values, window, count):
     return probabilities, indices, out, all_keys
 
 
+def stream_route_moments_rows(q, keys, values, window, count, pos, row_length=None):
+    """stream_route_moments for queries at sorted positions pos only (a subset's; the same numbers row by row).
+    row_length (cut_rows): keys are several rows of this length back to back, pos the queries' indices among them;
+    each query sees only its own row's keys."""
+    heads, length, width = keys.shape
+    rows = q.shape[0]
+    scores = torch.bmm(q.to(keys.dtype).transpose(0, 1), keys.transpose(1, 2))
+    keys_at = torch.arange(length, device=q.device)
+    lag = pos[:, None] - keys_at
+    blocked = (lag < 0) | (lag > window)
+    if row_length is not None:
+        blocked = blocked | (pos[:, None] // row_length != keys_at // row_length)
+    scores.masked_fill_(blocked, float('-inf'))
+    if row_length is None:
+        tops, indices = window_topk.window_topk(scores, count)
+    else:  # the top keys among each query's own row's scores (masked keys tied as in that row alone), indexed back
+        row = pos // row_length
+        own_row = scores.view(heads, rows, length // row_length, row_length)[
+            :, torch.arange(rows, device=q.device), row]
+        tops, indices = window_topk.window_topk(own_row, count)
+        indices = indices + (row * row_length)[:, None]
+    probabilities = torch.empty((heads, rows, count), device=q.device)
+    out = torch.empty((heads, rows, width), device=q.device)
+    all_keys = torch.empty_like(out)
+    _route_moment_rows_kernel[(rows // 32, heads)](scores, keys, values, tops, pos, probabilities, out, all_keys,
+      T=length, R=rows, WINDOW=window, KEYS=count, BM=32, BN=128, num_warps=4, num_stages=2)
+    return probabilities, indices, out, all_keys
+
+
 class Cut:
     def __init__(self, model, settings, seed, rank, world):
         self.model, self.s, self.world = model, settings, world
@@ -871,13 +1058,19 @@ class Cut:
         self.device = self.capture.device
         self.width = model.config.n_embd
         self.generator = torch.Generator(self.device).manual_seed(seed + 17 + 1000 * rank)
+        self.subset_generator = torch.Generator(self.device).manual_seed(seed + 19 + 1000 * rank)
         self._estimate_graph = None
         self._telemetry_health = []
         self._query_moment_errors = {}
         self._side_stream = torch.cuda.Stream()
+        self._adam_stream = torch.cuda.Stream()  # the rest's grads and AdamW's step (Cut.step)
+        self.weights_read = None  # the weight averages' event; the optimizer step waits on it
         self._gate_rows = {i: torch.empty(self.width, self.width, device=self.device)
         for i in range(self.model.config.n_layer)
         if has_ve(i, self.model.config.n_layer)}
+        self._gate_pending = False  # the next update's gate rows, drawn on their own stream
+        self._gate_stream = torch.cuda.Stream()
+        self._gate_staging = {i: torch.empty_like(rows) for i, rows in self._gate_rows.items()}
     def basis(self):
         signs = torch.randint(0, 2, (self.width,), device=self.device, generator=self.generator).float() * 2 - 1
         return hadamard(self.width, self.device, torch.float32) * signs
@@ -886,47 +1079,49 @@ class Cut:
         along the head axis so that each kernel launches once per window size. Returns per-layer contexts and key
         credits (heads, tokens, head_dim); the query moment credits go to self._query_moment_errors."""
         d, model, s = self.capture, self.model, self.s
-        L, h, t = model.config.n_layer, model.config.n_head, d.length
+        L, h, t, b = model.config.n_layer, model.config.n_head, d.length, d.batch
         cos, sin = model.cos[0, :t, 0].float(), model.sin[0, :t, 0].float()
         windows = {}
         for i in range(L):
             windows.setdefault(model.window_sizes[i][0], []).append(i)
         contexts, work = {}, []
         self._moment_inputs = {}
-        for window, layers in windows.items():
-            pick = lambda name: [d.outputs[f'transformer.h.{i}.attn.{name}'][0] for i in layers]
-            ves = [d.outputs[f'value_embeds.{i}'][0] if has_ve(i, L) else None for i in layers]
-            gates = [d.outputs[f'transformer.h.{i}.attn.ve_gate'][0] if has_ve(i, L) else None for i in layers]
+        for window, layers in windows.items():  # cut_rows: each layer's rows r as its own stacked group (i, r)
+            pairs = [(i, r) for i in layers for r in range(b)]
+            pick = lambda name: [d.outputs[f'transformer.h.{i}.attn.{name}'][r] for i, r in pairs]
+            ves = [d.outputs[f'value_embeds.{i}'][r] if has_ve(i, L) else None for i, r in pairs]
+            gates = [d.outputs[f'transformer.h.{i}.attn.ve_gate'][r] if has_ve(i, L) else None for i, r in pairs]
             (qp, kp, k_raw, values, hub), self._moment_inputs[window] = key_context_group_moments(
-                pick('c_q'), pick('c_k'), pick('c_v'), ves, gates, [targets[i][0] for i in layers], cos, sin, h,
+                pick('c_q'), pick('c_k'), pick('c_v'), ves, gates, [targets[i][r] for i, r in pairs], cos, sin, h,
                 s.query_moment_sigma)
             lse, center = moment_kernels.implicit_key_context_edges(qp, kp, values, hub, window)
             for j, i in enumerate(layers):
-                rows = slice(j * h, (j + 1) * h)
+                rows = slice(j * b * h, (j + 1) * b * h)
                 contexts[i] = (qp[rows], kp[rows], k_raw[rows], cos, sin, lse[rows],
                                (values[rows], hub[rows], center[rows]))
             work.append((window, layers, qp, kp, k_raw, values, hub, lse, center))
         return contexts, work
     def batched_key_scores_by_token(self, work, qkv, maps):
         """batched_key_scores with each layer's query and key credits written into columns [0, width) and
-        [width, 2 width) of the (layers, tokens, 3 width) buffer qkv (window group g's layers at maps[g]); returns the
-        key credits as (tokens, width) views (the query credits go to self._query_moment_errors as
-        (1, tokens, width) views)."""
+        [width, 2 width) of the (layers, tokens, 3 width) buffer qkv (window group g's stacked groups at maps[g] of its
+        (layers x rows, length, 3 width) view); returns the key credits as (tokens, width) views (the query credits go
+        to self._query_moment_errors as (rows, length, width) views)."""
         d, model, s = self.capture, self.model, self.s
-        h, t = model.config.n_head, d.length
+        h, t, b = model.config.n_head, d.length, d.batch
         hd = self.width // h
         cos, sin = model.cos[0, :t, 0].float(), model.sin[0, :t, 0].float()
         keys, w = {}, self.width
+        by_row = qkv.view(-1, t, qkv.shape[-1])  # cut_rows: layer i's row r at index i x rows + r
         for g, (window, layers, qp, kp, k_raw, values, hub, lse, center) in enumerate(work):
             moment_kernels.key_credits_into(qp, kp, k_raw, lse, values, hub, center, cos, sin, window, s.key_sigma,
-                                            qkv[:, :, w:2 * w], maps[g])
+                                            by_row[:, :, w:2 * w], maps[g])
             q16, k16, v16, hub16, q_raw, sq, steps = self._moment_inputs[window]
             moment_kernels.moment_query_scores_into(
                 q16, k16, v16, hub16, q_raw, sq, kp, cos[:, :hd // 2].contiguous(), sin[:, :hd // 2].contiguous(),
-                lse, center, steps, qkv[:, :, :w], window=window, layers=maps[g])
+                lse, center, steps, by_row[:, :, :w], window=window, layers=maps[g])
             for i in layers:
                 keys[i] = qkv[i, :, w:2 * w]
-                self._query_moment_errors[f'transformer.h.{i}.attn.c_q'] = qkv[i, :, :w].unsqueeze(0)
+                self._query_moment_errors[f'transformer.h.{i}.attn.c_q'] = qkv[i, :, :w].view(b, t, w)
         return keys
     def internals(self, gradients, targets, b, t, key_errors, raw_values, terminal_values):
         d = self.capture
@@ -956,70 +1151,78 @@ class Cut:
         anvil_ids = [id(q) for batch in optimizer.optimizers[0].batches for q in batch[0]]
         rank_of = {pid: k for k, pid in enumerate(anvil_ids)}
         self._flat_order = sorted(params, key=lambda item: rank_of.get(id(item[1]), len(anvil_ids)))
-    def step(self, x, y, optimizer):
-        if not hasattr(self, '_flat_order'):  # the warmup Cut binds on its first step
-            self.bind_flat_layout(optimizer)
-        self.prepare_gate_rows()
+    def estimate_rows(self, x, y):  # one estimate (eager, or a replay of its graph) with its gate rows
+        if self._gate_pending:
+            self.take_gate_rows()
+        else:
+            self.prepare_gate_rows()
         if self._estimate_graph is None:
             self.estimate(x, y)
         else:
             self._static_x.copy_(x)
             self._static_y.copy_(y)
             self._estimate_graph.replay()
+        self.prefetch_gate_rows()
+    def step(self, x, y, optimizer):
+        if not hasattr(self, '_flat_order'):  # the warmup Cut binds on its first step
+            self.bind_flat_layout(optimizer)
+        self.estimate_rows(x, y)
         valid = (y != -1).sum()
         optimizer.zero_grad(set_to_none=True)
-        # the estimate formed the flat buffer in this layout (ANVIL's shape groups first, so their stacked grads are
-        # views) and its bf16 copy, the wire
+        # the estimate formed the bf16 flat buffer, the wire, in this layout (ANVIL's shape groups first, so their
+        # stacked grads are views)
         params = self._flat_order
-        flat, wire = self._packed
-        # ANVIL's grads reduce-scattered in bf16, its shards first: each batch's update waits only for its own
-        # shard, and the rest's all-reduce runs under ANVIL's update
+        wire = self._packed
+        # ANVIL's grads reduce-scattered in bf16 into its graphs' static shards: each unit's update waits only for its
+        # own shards, and the rest's all-reduce runs under ANVIL's update
         anvil = optimizer.optimizers[0]
         sizes = [sum(q.numel() for q in batch[0]) for batch in anvil.batches]
         anvil.shard_grads, anvil.shard_works, offset = [], [], 0
-        for (batch_params, *_), size in zip(anvil.batches, sizes):
+        shards = anvil.shard_buffers(self.world, wire.dtype)
+        for k, ((batch_params, *_), size) in enumerate(zip(anvil.batches, sizes)):
             full = wire[offset:offset + size].view(len(batch_params), *batch_params[0].shape)
-            shard = torch.empty((len(batch_params) // self.world, *batch_params[0].shape), device=flat.device,
-                                dtype=wire.dtype)
-            anvil.shard_works.append(torch.distributed.reduce_scatter_tensor(shard, full, async_op=True))
-            anvil.shard_grads.append(shard)
+            anvil.shard_works.append(torch.distributed.reduce_scatter_tensor(shards[k], full, async_op=True))
+            anvil.shard_grads.append(shards[k])
             offset += size
         rest = torch.distributed.all_reduce(wire[sum(sizes):], async_op=True)
         anvil_ids = {id(q) for batch in anvil.batches for q in batch[0]}
 
-        def finish_rest():  # between ANVIL's and the other optimizers' steps
+        def finish_rest():  # on the side stream, between ANVIL's and AdamW's steps
             rest.wait()
-            # bf16 params' grads are views of the reduced wire (what .to(bf16) of its fp32 copy gives),
-            # fp32 params' slices copied once; the finite check reads the bf16 wire
+            # the other params' grads from the reduced wire: views for bf16 params, fp32 casts of their slices
+            # otherwise; the finite check reads the bf16 wire
             self._telemetry_health.append(torch.isfinite(torch.sum(wire, dtype=torch.float32)))
             offset = 0
             for _, p in params:
                 if id(p) not in anvil_ids:
                     part = slice(offset, offset + p.numel())
-                    if p.dtype == wire.dtype:
-                        p.grad = wire[part].view_as(p)
-                    else:
-                        flat[part] = wire[part]
-                        p.grad = flat[part].view_as(p).to(p.dtype)
+                    p.grad = wire[part].view_as(p) if p.dtype == wire.dtype else wire[part].view_as(p).to(p.dtype)
                 offset += p.numel()
-        optimizer.step(between=finish_rest)
+        if self.weights_read is not None:  # the weight averages (side stream) read the weights this step overwrites
+            torch.cuda.current_stream().wait_event(self.weights_read)
+            self.weights_read = None
+        side = self._adam_stream  # AdamW and its grads wait for this point of the main stream, not for ANVIL's update
+        side.wait_stream(torch.cuda.current_stream())
+        optimizer.step(between=finish_rest, side=side)
         for work in anvil.gather_works:
             work.wait()
         anvil.gather_works = []
+        torch.cuda.current_stream().wait_stream(side)  # (the next estimate overwrites the wire AdamW's grads view)
+        # this rank's loss: each flush averages the ranks (one all-reduce per flush)
         diagnostic_loss = torch.where(y != -1, self.capture.clean_loss, 0).sum() / valid
-        return average_ranks(diagnostic_loss.reshape(1)).reshape(())
+        return diagnostic_loss.reshape(())
     def fused_descending_key_values(self, chain, targets, x0, outs):
         """descending_key_values (batched keys on the side stream, batched values and gates) with the credits in the
         layout their consumers read, and the chain's glue and path_scalar_credit in one compiled graph. Returns its
         outputs and the path scalars."""
         d, s, model = self.capture, self.s, self.model
-        L, h, t = model.config.n_layer, model.config.n_head, d.length
+        L, h, t, b = model.config.n_layer, model.config.n_head, d.length, d.batch
         hd = self.width // h
         errors, raw_values, terminal_values = {}, {}, {}
         contexts, work = self.batched_key_contexts(targets)
         # every layer's query, key and value credits by token, side by side: one batched reassembly GEMM
-        qkv = torch.empty(L, t, 3 * self.width, device=self.device)
-        maps = [self.layer_map(item[1]) for item in work]
+        qkv = torch.empty(L, b * t, 3 * self.width, device=self.device)
+        maps = [self.layer_map([i * b + r for i in item[1] for r in range(b)]) for item in work]  # (cut_rows: (i, r))
         main, side = torch.cuda.current_stream(), self._side_stream
         side.wait_stream(main)
         qkv.record_stream(side)
@@ -1034,33 +1237,36 @@ class Cut:
         raws, place = {}, {}
         for g, (window, layers, qp, kp, k_raw, values, hub, lse, center) in enumerate(work):
             raw = moment_kernels.raw_value_credits_by_token(qp, kp, lse, hub, window, h)
+            raw = raw.view(len(layers), b * t, raw.shape[-1])  # (cut_rows: each layer's rows back to back)
             for j, i in enumerate(layers):
                 raws[i], place[i] = raw[j], (g, j)
         ve_layers = [i for i in range(L) if has_ve(i, L)]
         gates = dict(zip(ve_layers, stacked_gate_input_responses(
-            [raws[i] for i in ve_layers], [d.outputs[f'value_embeds.{i}'][0] for i in ve_layers],
+            [raws[i] for i in ve_layers], [d.outputs[f'value_embeds.{i}'].flatten(0, 1) for i in ve_layers],
             [d.blocks[i] for i in ve_layers], [model.transformer.h[i].attn.ve_gate.weight for i in ve_layers],
             [self._gate_rows[i] for i in ve_layers], s.gate_path_sigma)))
         input_list, extra_list, path = descending_inputs_eager(
             [raws[i] for i in range(L)], [gates.get(i) for i in range(L)], [d.blocks[i] for i in range(L)],
             [model.transformer.h[i].attn.c_v.weight.float() for i in range(L)], model.resid_lambdas.float(), x0,
             outs)
-        corrected = [torch.empty(len(item[1]), t, self.width, device=self.device) for item in work]
+        corrected = [torch.empty(len(item[1]), b * t, self.width, device=self.device) for item in work]
         for i in range(L):  # corrected by token, straight into the terminal pass's input
             g, j = place[i]
             torch.mm(chain[i] + extra_list[i], model.transformer.h[i].attn.c_proj.weight.float(), out=corrected[g][j])
         w = self.width
+        by_row = qkv.view(L * b, t, 3 * w)
         for g, (window, layers, qp, kp, k_raw, values, hub, lse, center) in enumerate(work):
-            moment_kernels.terminal_value_credits_into(qp, kp, lse, corrected[g], window, qkv[:, :, 2 * w:], maps[g])
+            moment_kernels.terminal_value_credits_into(qp, kp, lse, corrected[g].view(-1, t, self.width), window,
+                                                       by_row[:, :, 2 * w:], maps[g])
             for i in layers:
-                terminal_values[i] = qkv[i, :, 2 * w:].view(1, t, h, hd)
+                terminal_values[i] = qkv[i, :, 2 * w:].view(b, t, h, hd)
         self._qkv = qkv
         for i in range(L):
-            raw_values[i] = raws[i].view(1, t, h, hd)
+            raw_values[i] = raws[i].view(b, t, h, hd)
         main.wait_stream(side)
         for i in range(L):
             keys[i].record_stream(main)
-            errors[f'transformer.h.{i}.attn.c_k'] = keys[i].unsqueeze(0)
+            errors[f'transformer.h.{i}.attn.c_k'] = keys[i].view(b, t, self.width)
             self._query_moment_errors[f'transformer.h.{i}.attn.c_q'].record_stream(main)
         return (errors, raw_values, terminal_values, dict(enumerate(extra_list)), dict(enumerate(input_list)),
                 path)
@@ -1082,9 +1288,12 @@ class Cut:
                                                     credit, h)
         return errors
     def probe_moments(self, x, y):
-        derivative, self._head_moments = probe_moment_terms(x, y, self.model.lm_head.weight.float(), self.basis())
+        derivative, self._head_moments, self._head_base = probe_moment_terms(x, y, self.model.lm_head.weight.float(),
+                                                                             self.basis())
         return derivative
     def close(self):
+        if self._gate_pending:
+            self.take_gate_rows()
         if self._estimate_graph is not None:
             torch.cuda.synchronize()
             self._estimate_graph = None
@@ -1092,20 +1301,36 @@ class Cut:
             self._static_x = self._static_y = None
             self._gate_rows.clear()
         self.capture.close()
-    def prepare_gate_rows(self):
+    def prepare_gate_rows(self, out=None):
         generator = torch.Generator(self.device).set_state(self.generator.get_state())
         # Skip the frames the next estimate draws from self.generator: the readout probe's, then one per chain root.
         for _ in range(1 + len(self.s.chain_depth_roots)):
             torch.randint(0, 2, (self.width,), device=self.device, generator=generator)
         frame = hadamard(self.width, self.device, torch.float32)
-        for rows in self._gate_rows.values():
+        for rows in (self._gate_rows if out is None else out).values():
             indices = torch.randperm(self.width, device=self.device, generator=generator)
             signs = torch.randint(0, 2, (self.width,), device=self.device, generator=generator) * 2 - 1
             rows.copy_(frame[indices] * signs)
+    def prefetch_gate_rows(self):
+        """The next update's gate rows, drawn on a side stream under this update's estimate. The draws
+        depend only on self.generator's host-side state, which this update's estimate has already moved past its own
+        draws (eagerly, or as a replay: the graph registers the generator, so replay() advances its offset on the host),
+        so they are the rows the next step's prepare_gate_rows would draw. Never captured: called outside the graph."""
+        main, side = torch.cuda.current_stream(), self._gate_stream
+        with torch.cuda.stream(side):
+            self.prepare_gate_rows(self._gate_staging)
+            side.wait_stream(main)  # the estimate has read this update's rows
+            torch._foreach_copy_(list(self._gate_rows.values()), list(self._gate_staging.values()))
+        self._gate_pending = True
+    def take_gate_rows(self):
+        torch.cuda.current_stream().wait_stream(self._gate_stream)
+        self._gate_pending = False
     @torch.no_grad()
     def capture_estimate_graph(self, x, y):
         self._static_x, self._static_y = x.clone(), y.clone()
         generators = [self.generator, self.capture.shared_generator, self.capture.generator]
+        if min(self.s.chain_fraction) < 1:
+            generators.append(self.subset_generator)
         states = [g.get_state() for g in generators]
         default_state = torch.cuda.get_rng_state()
         def restore_rng():
@@ -1142,53 +1367,76 @@ class Cut:
         w_out_t = chain_transposes([self._bf16_weights[p + 'c_proj'] for p in names])
         lam_r, lam_0 = model.resid_lambdas.float(), model.x0_lambdas.float()
         xL = outs[-1]
-        base = xL @ weight.T
+        base = self._head_base  # (probe_moments' logits)
         target_w = weight[y.clamp(min=0)]
         moments = self._head_moments
         n, m = e.shape[0], s.chain_tokens
+        shallow, deep = s.chain_depth_roots  # blocks L-4 and L-2
         by_site = {}
-        for site in s.chain_depth_roots:
+        for site in s.chain_depth_roots:  # (the routed root draws a frame too, unused: the gate rows skip both)
             H = self.basis()
             steps = s.chain_sigma * mids[site].square().mean(-1, keepdim=True).sqrt().clamp(min=1e-6)
             by_site[site] = (H, steps, torch.empty(n, self.width, device=self.device))
         signed_steps = {}
         controls = {}
-        groups = tuple((root,) for root in s.chain_depth_roots)  # (each root replays alone)
-        for group in groups:
-            for site in group:
-                steps = by_site[site][1]
-                sign = (torch.randint(0, 2, (n, 1), device=self.device) * 2 - 1).float()
-                signed_steps[site] = steps * sign
-                factor = lam_r[site + 1:].prod()
-                controls[site] = g_top * factor
-        roots = list(s.chain_depth_roots)
-        root_projections = dict(zip(roots, root_projections_of([w_fc[r] for r in roots],
-                                                               [by_site[r][0] for r in roots])))
-        replay_layers = lambda group: (attention_replay_layers(group, L, s.query_replay_long_layers))
-        active_query_layers = tuple(sorted({b for group in groups for b in replay_layers(group)}))
-        own = self.own_query_inputs(active_query_layers)
-        own = self.strong_keys(own, s.query_keys)
-        boost = 1.0
+        for site in s.chain_depth_roots:
+            steps = by_site[site][1]
+            sign = (torch.randint(0, 2, (n, 1), device=self.device) * 2 - 1).float()
+            signed_steps[site] = steps * sign
+            factor = lam_r[site + 1:].prod()
+            controls[site] = g_top * factor
+        root_projection = root_projections_of([w_fc[shallow]], [by_site[shallow][0]])[0]
+        replay_layers = lambda site: attention_replay_layers((site,), L, s.query_replay_long_layers)
+        active_query_layers = tuple(sorted({b for site in s.chain_depth_roots for b in replay_layers(site)}))
+        inputs = self.own_query_inputs(active_query_layers)
+        # strong keys on all tokens only for the layers a full replay reads; a subsetted root's other layers get them
+        # on its subset (own_sub), the routing of each query row unchanged
+        full = {b for site, fraction in zip(s.chain_depth_roots, s.chain_fraction)
+                if min(n, max(64, round(fraction * n / 64) * 64)) == n for b in replay_layers(site)}
+        own = self.strong_keys(inputs, s.query_keys, layers=full)
         chunks = [slice(t0, t0 + m) for t0 in range(0, n, m)]
-        for sl in chunks:
-            own_sl = (own[0][sl], [None if z is None else z[sl] for z in own[1]], own[2]) + tuple(
-                [None if z is None else z[sl] for z in part] for part in own[3:6]) + own[6:]
-            for group in groups:
-                site = group[0]
-                H = by_site[site][0]
-                steps = signed_steps[site][sl]
+        own_of = lambda sl: (own[0][sl], [None if z is None else z[sl] for z in own[1]], own[2]) + tuple(
+            [None if z is None else z[sl] for z in part] for part in own[3:6]) + own[6:]
+        def own_sub(sl, site):
+            shared = own_of(sl)
+            mine = self.strong_keys(inputs, s.query_keys, sl, set(replay_layers(site)) - full)
+            return shared[:3] + tuple([a if b is None else b for a, b in zip(shared[j], mine[j])]
+                                      for j in (3, 4, 5)) + shared[6:]
+        def replay(sl, site, boost, own_sl):
+            if site == deep:  # the same signed steps (x SPAN_STEP) along each token's routed span, decoded per token
+                steps = SPAN_STEP * signed_steps[site][sl]
+                idx_sl = [None if r[0] is None else r[0][sl] for r in routes]
+                mids_sl = [z[sl] for z in mids]
+                frame, projection = routed_frame(w_fc, idx_sl, mids_sl, (site, site + 1), site)
                 loss_change = chain_chunk(
-                    site, (steps, H), [z[sl] for z in mids], xL[sl], [None if r[0] is None else r[0][sl] for r in routes],
-                    [None if r[1] is None else r[1][sl] for r in routes], lam_r, w_fc, w_out_t, base[sl], target_w[sl], y[sl], own_sl,
-                    moments=tuple(z[sl] for z in moments),
-                    root_projection=root_projections[site], query_layers=replay_layers(group),
-                )
-                news = group_credits(loss_change, [signed_steps[o][sl] for o in group],
-                                     [controls[o][sl] for o in group], [by_site[o][0] for o in group], boost)
-                for other, new in zip(group, news):
-                    by_site[other][2][sl] = new
+                    site, (steps, frame), mids_sl, xL[sl], idx_sl, [None if r[1] is None else r[1][sl] for r in routes],
+                    lam_r, w_fc, w_out_t, base[sl], target_w[sl], y[sl], own_sl, moments=tuple(z[sl] for z in moments),
+                    root_projection=projection, query_layers=replay_layers(site))
+                by_site[site][2][sl] = span_decode(loss_change, steps, controls[site][sl], frame, boost, s.span_cg)
+                return
+            H = by_site[site][0]
+            steps = signed_steps[site][sl]
+            loss_change = chain_chunk(
+                site, (steps, H), [z[sl] for z in mids], xL[sl], [None if r[0] is None else r[0][sl] for r in routes],
+                [None if r[1] is None else r[1][sl] for r in routes], lam_r, w_fc, w_out_t, base[sl], target_w[sl],
+                y[sl], own_sl, moments=tuple(z[sl] for z in moments), root_projection=root_projection,
+                query_layers=replay_layers(site))
+            news = group_credits(loss_change, [signed_steps[site][sl]], [controls[site][sl]], [H], boost)
+            by_site[site][2][sl] = news[0]
+        # the deep root first; the shallow root's control is its credit carried down. Each root on its own token
+        # subset (importance-drawn); the rest keep the control, the replayed weighted 1 / pi
+        for site, fraction in ((deep, s.chain_fraction[1]), (shallow, s.chain_fraction[0])):
+            if site == shallow:  # root L-2's credit through the residual scalars between them
+                controls[site] = by_site[deep][2] * lam_r[site + 1:deep + 1].prod()
+            count = min(n, max(64, round(fraction * n / 64) * 64))
+            if count == n:
+                for sl in chunks:
+                    replay(sl, site, 1.0, own_of(sl))
                 continue
-        del own_sl, own
+            sl, weights = self.pps_subset(controls[site].norm(dim=-1), count)
+            by_site[site][2].copy_(controls[site])
+            replay(sl, site, weights, own_sub(sl, site))
+        del own
         credits = {site: credit for site, (_, _, credit) in by_site.items()}
         measured = [credits.get(i) for i in range(L)]
         mids_c, lams, x0_credit = chain_tail(measured, g_top, lam_r, lam_0, x0, outs)
@@ -1198,10 +1446,32 @@ class Cut:
         credits['emb'] = norm_input_credit(e, x0_credit, s.chain_sigma,
                                            hadamard(self.width, self.device, torch.float32))
         return credits
+    def pps_subset(self, size, count):
+        """count tokens drawn with probability proportional to size (a chain_pps_floor share uniform) by systematic
+        sampling: one random offset on the cumulative inclusion probabilities pi, so exactly count sorted distinct
+        tokens (static shape, no sort), in one Triton program. Returns them and their Horvitz-Thompson weights
+        1 / pi."""
+        n, floor = size.shape[0], self.s.chain_pps_floor
+        if getattr(self, '_pps_params', None) is None:  # (made in the eager warmup, before the graph capture)
+            self._pps_params = torch.tensor([floor / n, 1 - floor], device=self.device, dtype=torch.float64)
+        offset = torch.rand(1, device=self.device, generator=self.subset_generator, dtype=torch.float64)
+        pi = torch.empty(n, device=self.device, dtype=torch.float64)
+        sl = torch.empty(count, device=self.device, dtype=torch.int64)
+        weights = torch.empty(count, 1, device=self.device)
+        _pps_draw_kernel[(1,)](size.contiguous(), self._pps_params, offset, pi, sl, weights, N=n, COUNT=count,
+                               BINS=triton.next_power_of_2(count + 1), PASSES=8, num_warps=8)
+        return sl, weights
     def own_query_inputs(self, active_layers):
+        """cut_rows: the rows' tokens back to back (pos: each one's position in its row), keys (heads, tokens,
+        head_dim) likewise."""
         d, model = self.capture, self.model
-        length, heads = d.length, model.config.n_head
+        length, heads, b = d.length, model.config.n_head, d.batch
         cos, sin = model.cos[0, :length, 0].float(), model.sin[0, :length, 0].float()
+        pos = torch.arange(length, device=self.device)
+        rows_of, by_token = (lambda z: z[0]), (cos, sin)
+        if b > 1:
+            pos = pos.repeat(b)
+            rows_of, by_token = (lambda z: z.flatten(0, 1)), (cos[pos], sin[pos])
         inputs, w_q, keys, values, w_proj_t, windows = [], [], [], [], [], []
         for i, block in enumerate(model.transformer.h):
             if i not in active_layers:
@@ -1210,28 +1480,52 @@ class Cut:
                 continue
             prefix = f'transformer.h.{i}.attn.'
             gated = block.attn.ve_gate is not None
-            k, v = own_query_tensors(d.outputs[prefix + 'c_k'][0], d.outputs[prefix + 'c_v'][0],
-                                     d.outputs[prefix + 've_gate'][0] if gated else None,
-                                     d.outputs[f'value_embeds.{i}'][0] if gated else None, cos, sin, heads)
-            inputs.append(d.blocks[i][0].float())
+            k, v = own_query_tensors(rows_of(d.outputs[prefix + 'c_k']), rows_of(d.outputs[prefix + 'c_v']),
+                                     rows_of(d.outputs[prefix + 've_gate']) if gated else None,
+                                     rows_of(d.outputs[f'value_embeds.{i}']) if gated else None, *by_token, heads)
+            inputs.append(rows_of(d.blocks[i]).float())
             w_q.append(block.attn.c_q.weight.float())
             keys.append(k)
             values.append(v)
             w_proj_t.append(block.attn.c_proj.weight.float().T.contiguous())
             windows.append(model.window_sizes[i][0])
             continue
-        return (torch.arange(length, device=self.device), inputs, w_q, keys, values, w_proj_t, cos, sin, windows)
+        return (pos, inputs, w_q, keys, values, w_proj_t, cos, sin, windows)
     @staticmethod
-    def strong_keys(own, k):
+    def strong_keys(own, k, sl=None, layers=None):
+        """sl (a subset): only these sorted query tokens; layers: only these layers (the rest None). cut_rows:
+        each row's queries routed among its own keys (all tokens: row by row; sl: the rows' keys back to back, the
+        other rows' keys masked)."""
         pos, inputs, w_q, keys, values, w_proj_t, cos, sin, windows = own
+        length = cos.shape[0]
+        b = pos.shape[0] // length
         top_keys, top_values, top_p = [], [], []
-        for x, wq, kk, vv, window, wp in zip(inputs, w_q, keys, values, windows, w_proj_t):
-            if x is None:
+        for i, (x, wq, kk, vv, window, wp) in enumerate(zip(inputs, w_q, keys, values, windows, w_proj_t)):
+            if x is None or layers is not None and i not in layers:
                 top_keys.append(None), top_values.append(None), top_p.append(None)
                 continue
             heads, _, width = kk.shape
-            q = strong_queries(x, wq, cos, sin, heads)
-            p, idx, out, all_keys = stream_route_moments(q, kk, vv, window, k)
+            if sl is None and b > 1:
+                parts = []
+                for r in range(b):
+                    span = slice(r * length, (r + 1) * length)
+                    kr, vr = kk[:, span].contiguous(), vv[:, span].contiguous()
+                    p, idx, out, all_keys = stream_route_moments(strong_queries(x[span], wq, cos, sin, heads), kr, vr,
+                                                                 window, k)
+                    ktop, vtop, rest = strong_key_tensors(kr, vr, idx, p, out, all_keys)
+                    parts.append((ktop, project_routed_values_token_major(vtop, p, rest, wp), p.transpose(0, 1)))
+                for acc, part in zip((top_keys, top_values, top_p), zip(*parts)):
+                    acc.append(torch.cat(part))
+                continue
+            if sl is None:
+                q = strong_queries(x, wq, cos, sin, heads)
+                p, idx, out, all_keys = stream_route_moments(q, kk, vv, window, k)
+            elif b > 1:
+                q = strong_queries(x[sl], wq, cos[pos[sl]], sin[pos[sl]], heads)
+                p, idx, out, all_keys = stream_route_moments_rows(q, kk, vv, window, k, sl, length)
+            else:
+                q = strong_queries(x[sl], wq, cos[sl], sin[sl], heads)
+                p, idx, out, all_keys = stream_route_moments_rows(q, kk, vv, window, k, pos[sl])
             ktop, vtop, rest = strong_key_tensors(kk, vv, idx, p, out, all_keys)
             top_keys.append(ktop)
             top_values.append(project_routed_values_token_major(vtop, p, rest, wp))
@@ -1313,9 +1607,8 @@ class Cut:
         self.internals(gradients, targets, b, t, key_errors, raw_values, terminal_values)
         gradients['transformer.wte.weight'] = d.reassemble('transformer.wte', chain['emb'].view(b, t, self.width))
         gradients['resid_lambdas'], gradients['x0_lambdas'] = scalars[0], scalars[1]
-        # Cut.step's flat buffer (and bf16 copy) formed here, inside the estimate graph
-        self._packed = pack_gradients([gradients[name] for name, _ in self._flat_order],
-                                      (y != -1).sum() * self.world, True)
+        # Cut.step's bf16 flat buffer formed here, inside the estimate graph
+        self._packed = pack_gradients([gradients[name] for name, _ in self._flat_order], (y != -1).sum() * self.world)
         return gradients
 
 
@@ -1416,6 +1709,8 @@ class BatchedAnvil(torch.optim.Optimizer):
         self.total, self.warmup, self.cooldown, self.engage = (round(k * steps / RUN[0]) for k in RUN)
         self.polar_margin, self.fast_weight = polar_margin, fast_weight
         self.t = 0
+        self._shards, self._t_dev, self.graphs = None, None, None  # the CUDA graphs' static shards and step index
+        self._unit_stream = torch.cuda.Stream()  # the later units' graphs, under the first's
 
     def prepare_scalar_schedule(self, warmdown, final, decay_factors, warmup=0):
         group = self.param_groups[0]
@@ -1457,16 +1752,34 @@ class BatchedAnvil(torch.optim.Optimizer):
                 groups.setdefault((min(rows, cols), max(rows, cols)), []).append(k)
         return [ks for ks in groups.values() if len(ks) > 1]
 
-    def merged_shard_step(self, ks, scalars):
-        """The sharded step of batches ks (polar partners) with one polar: wait each shard, update, all-gather."""
+    def gather(self, w, new):
+        """All-gather a batch's updated rows into w (waited in Cut.step)."""
+        work = dist.all_gather_into_tensor(w, new.to(w.dtype).contiguous(), async_op=True)
+        self.gather_works = getattr(self, 'gather_works', []) + [work]
+
+    def shard_buffers(self, world, dtype):
+        """Each batch's reduce-scatter output, allocated once (the graphs read them)."""
+        if self._shards is None:
+            self._shards = [torch.empty((len(params) // world, *params[0].shape), device=params[0].device,
+                                        dtype=dtype) for params, *_ in self.batches]
+        return self._shards
+
+    def units(self):
+        """step's order of work: each batch alone, or its polar partners at the group's last batch."""
+        merged = {k: tuple(ks) for ks in self.polar_partners() for k in ks}
+        return [merged.get(k, (k,)) for k in range(len(self.batches)) if k not in merged or k == merged[k][-1]]
+
+    def unit_news(self, ks):
+        """The all-gather inputs of unit ks (its shards already waited for), with the scalar schedule's row at the
+        device step index."""
         world, rank = dist.get_world_size(), dist.get_rank()
+        scalars = self.scalar_schedule.index_select(0, self._t_dev)[0].unbind()
         gs, ws, views, fasts, slows, energies, lanes, ratios = [], [], [], [], [], [], [], []
         for k in ks:
             params, state, lane, ratio = self.batches[k]
             per = len(params) // world
             sl = slice(rank * per, (rank + 1) * per)
             w = stacked_view([p.data for p in params])
-            self.shard_works[k].wait()
             gs.append(self.shard_grads[k].float())
             ws.append(w[sl].float())
             views.append(w)
@@ -1475,33 +1788,74 @@ class BatchedAnvil(torch.optim.Optimizer):
             energies.append(state['energy'][sl])
             lanes.append(lane)
             ratios.append(ratio)
-        news = anvil_update_merged(gs, ws, fasts, slows, energies, *scalars, tuple(lanes), tuple(ratios),
-                                   self.polar_margin)
-        for w, new in zip(views, news):
-            work = dist.all_gather_into_tensor(w, new.to(w.dtype).contiguous(), async_op=True)
-            self.gather_works = getattr(self, 'gather_works', []) + [work]
+        if len(ks) == 1:
+            news = [anvil_update(gs[0], ws[0], fasts[0], slows[0], energies[0], *scalars, lanes[0], ratios[0],
+                                 self.polar_margin)]
+        else:
+            news = anvil_update_merged(gs, ws, fasts, slows, energies, *scalars, tuple(lanes), tuple(ratios),
+                                       self.polar_margin)
+        return [new.to(w.dtype).contiguous() for new, w in zip(news, views)]
+
+    @torch.no_grad()
+    def capture_graphs(self, world, dtype):
+        """Each unit's math as a CUDA graph on the static shards (capture only: no kernel runs, no state changes); step
+        advances the device step index after all units. Called untimed, after the eager warmup has compiled
+        unit_news."""
+        if self._t_dev is None:
+            self._t_dev = torch.zeros(1, dtype=torch.long, device=self.scalar_schedule.device)
+        self.shard_grads = self.shard_buffers(world, dtype)
+        units, pool, graphs = self.units(), torch.cuda.graph_pool_handle(), []
+        enabled = torch.are_deterministic_algorithms_enabled()
+        warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+        try:
+            torch.use_deterministic_algorithms(True)  # (as in Optimizers.step: the same compiled code)
+            for i, ks in enumerate(units):
+                graph = torch.cuda.CUDAGraph()
+                torch._C._cuda_clearCublasWorkspaces()
+                if i > 0:  # (replayed under the first unit's graph: memory of its own)
+                    pool = torch.cuda.graph_pool_handle()
+                with torch.cuda.graph(graph, pool=pool, capture_error_mode='thread_local'):
+                    news = self.unit_news(ks)
+                graphs.append((graph, news))
+        finally:
+            torch.use_deterministic_algorithms(enabled, warn_only=warn_only)
+        self.graphs = graphs
+        self.shard_grads = None
 
     @torch.no_grad()
     def step(self):
         """Each batch from the shard of its gradient that Cut.step reduce-scattered to this rank (shard_grads, waited
         for in shard_works): this rank updates its 1/world of the batch and all-gathers it (gather_works); polar
-        partners share one polar."""
-        scalars = self.scalar_schedule[self.t].unbind()
-        merged = {k: ks for ks in self.polar_partners() for k in ks}
-        world, rank = dist.get_world_size(), dist.get_rank()
-        for k, (params, state, lanes, ratio) in enumerate(self.batches):
-            if k in merged:
-                if k == merged[k][-1]:  # one polar for the whole group, at its last batch
-                    self.merged_shard_step(merged[k], scalars)
-                continue
-            per = len(params) // world
-            sl = slice(rank * per, (rank + 1) * per)
-            w = stacked_view([p.data for p in params])
-            self.shard_works[k].wait()
-            new = anvil_update(self.shard_grads[k].float(), w[sl].float(), state['fast'][sl], state['slow'][sl],
-                               state['energy'][sl], *scalars, lanes, ratio, self.polar_margin)
-            work = dist.all_gather_into_tensor(w, new.to(w.dtype).contiguous(), async_op=True)
-            self.gather_works = getattr(self, 'gather_works', []) + [work]
+        partners share one polar. Each unit is a replay of its CUDA graph once its shards are in, the later units on
+        a side stream under the first's. Before the graphs exist (the throwaway warmup's first step) the same code
+        runs eagerly; its second step captures them."""
+        if self._t_dev is None:
+            self._t_dev = torch.zeros(1, dtype=torch.long, device=self.scalar_schedule.device)
+        if self.graphs is None and self.t >= 1:
+            shards, self.shard_grads = self.shard_grads, None
+            self.capture_graphs(dist.get_world_size(), shards[0].dtype)
+            self.shard_grads = shards
+        units = self.units()
+        main = torch.cuda.current_stream()
+        concurrent = self.graphs is not None
+        if concurrent:  # (the side stream reads this update's shards and weights after main's point here)
+            self._unit_stream.wait_stream(main)
+        for i, ks in enumerate(units):
+            with torch.cuda.stream(self._unit_stream) if concurrent and i > 0 else contextlib.nullcontext():
+                for k in ks:
+                    self.shard_works[k].wait()
+                if self.graphs is None:
+                    news = self.unit_news(ks)
+                    if i == len(units) - 1:
+                        self._t_dev.add_(1)
+                else:
+                    graph, news = self.graphs[i]
+                    graph.replay()
+                for k, new in zip(ks, news):
+                    self.gather(stacked_view([p.data for p in self.batches[k][0]]), new)
+        if concurrent:  # every unit has read the step index
+            main.wait_stream(self._unit_stream)
+            self._t_dev.add_(1)
         self.shard_grads = None
         self.t += 1
 
@@ -1512,15 +1866,17 @@ class Optimizers:
     def zero_grad(self, set_to_none):
         for o in self.optimizers:
             o.zero_grad(set_to_none=set_to_none)
-    def step(self, between=None):
+    def step(self, between, side):
+        """ANVIL's step on the current stream; between and the other optimizers' steps on the side stream."""
         enabled = torch.are_deterministic_algorithms_enabled()
         warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
         try:
             torch.use_deterministic_algorithms(True)
-            for k, o in enumerate(self.optimizers):
-                if k == 1 and between is not None:
-                    between()
-                o.step()
+            self.optimizers[0].step()
+            with torch.cuda.stream(side):
+                between()
+                for o in self.optimizers[1:]:
+                    o.step()
         finally:
             torch.use_deterministic_algorithms(enabled, warn_only=warn_only)
 
@@ -1562,274 +1918,42 @@ def make_optimizer(model, recipe, steps):
     late_from = round(275 / 1043 * steps)
     decay_factors = tuple(recipe.late_cut_decay_multiplier if t >= late_from else 1.0 for t in range(steps))
     anvil.prepare_scalar_schedule(recipe.warmdown, recipe.final, decay_factors, recipe.cut_warmup)
+    stages = row_stages(recipe)
+    for k, (share, _, rate) in enumerate(stages):  # cut_rows_rate: ANVIL's rate (column 5) on each stage's updates
+        if rate != 1:
+            end = round(stages[k + 1][0] * steps) if k + 1 < len(stages) else None
+            anvil.scalar_schedule[round(share * steps):end, 5] *= rate
     return Optimizers(anvil, adam)
 
 
-def set_rate(optimizer, step, steps, warmdown, final, warmup=0):
+def set_rate(optimizer, step, steps, warmdown, final, warmup=0, scale=1.0):
     left = (steps - step + 1) / steps
     ramp = min(1.0, step / warmup) if warmup else 1.0
     for group in optimizer.optimizers[1].param_groups:  # AdamW; ANVIL's rates are precomputed in its scalar schedule
         group.setdefault('initial_lr', group['lr'])
         group['lr'] = group['initial_lr'] * ramp * (final + (1 - final) * min(1.0, left / warmdown))
+        if scale != 1:  # (cut_rows_rate)
+            group['lr'] *= scale
 
 
-def merge_part(name):
-    if name.startswith('transformer.h.') and 've_gate' not in name:
-        return '.'.join(name.split('.')[2:5])
-    return 've_gates' if 've_gate' in name else name
-
-
-HOLDOUT = 64
+HOLDOUT = 64  # rows drawn after the identity rows' removal and never read (the earlier merge races' held-out rows)
+ROW_PRUNE = 0.015  # this share of the Cut rows (whole largest-batch updates) left unused, picked in the timer by
+# their unigram KL to the Cut rows' unigram (difficulty_order)
 MERGE_FROM, MERGE_EVERY = 0.3, 5
-MERGE_DECAYS = (0.03, 0.02)
-MERGE_RHOS = (1.0,)
-MERGE_K, MERGE_TOKENS = 64, 512
-
-
-MERGE_SKETCH_COLUMNS = 128
+MERGE_DECAY, MERGE_COEF = 0.04, 0.75  # the end weights: final + MERGE_COEF x (average - final), every weight; the
+# choice of every earlier race on the held-out rows (rho 1.0, decay 0.04, coef 0.75 in every part; seeds 0, 1, 3)
 
 
 @torch.no_grad()
-def merge_sketch_frame(width, columns, device, generator):
-    raw = torch.randn(width, columns, device=device,
-      generator=generator, dtype=torch.float32)
-    return torch.linalg.qr(raw, mode='reduced')[0].contiguous()
-
-
-@torch.no_grad()
-def merge_sketch_add(x, omega):
-    with torch.autocast('cuda', enabled=False):
-        xf = x.reshape(-1, x.shape[-1]).float()
-        return (xf.T @ (xf @ omega)).double()
-
-
-@torch.no_grad()
-def merge_nystrom_basis(y, omega, k):
-    middle = omega.double().T @ y
-    eigen, vectors = torch.linalg.eigh((middle + middle.T) * .5)
-    floor = eigen[-1].clamp_min(1e-30) * 1e-6
-    inverse = torch.where(eigen > floor, eigen.clamp_min(floor).rsqrt(), 0.)
-    factor = y @ (vectors * inverse.unsqueeze(0))
-    q, r = torch.linalg.qr(factor, mode='reduced')
-    _, u = torch.linalg.eigh(r @ r.T)
-    return (q @ u[:, -k:].flip(1)).float().contiguous()
-
-
-@torch.no_grad()
-def curvature_bases(model, rows, rank, k=MERGE_K):
-    device = next(model.parameters()).device
-    layers = [(name + '.weight', mod) for name, mod in model.named_modules()
-      if isinstance(mod, nn.Linear) and 've_gate' not in name]
-    bases = {key: torch.zeros(mod.weight.shape[1], k, device=device) for key, mod in layers}
-    order = torch.zeros(model.config.vocab_size, dtype=torch.long, device=device)
-    if rank == 0:
-        generator = torch.Generator(device=device).manual_seed(SEED)
-        frames = {key: merge_sketch_frame(mod.weight.shape[1], MERGE_SKETCH_COLUMNS,
-        device, generator) for key, mod in layers}
-        acc = {key: torch.zeros_like(omega, dtype=torch.float64) for key, omega in frames.items()}
-        hooks = []
-        for key, mod in layers:
-            def hook(module, inputs, output, key=key):
-                acc[key].add_(merge_sketch_add(inputs[0], frames[key]))
-            hooks.append(mod.register_forward_hook(hook))
-        counts = torch.zeros(model.config.vocab_size, dtype=torch.float64, device=device)
-        for batch in rows.split(4):
-            batch = batch.to(device)
-            with torch.autocast('cuda', dtype=torch.bfloat16):
-                model(batch[:, :-1].contiguous(), batch[:, 1:].contiguous(), loss_reduction='sum')
-            counts += torch.bincount(batch[:, :-1].reshape(-1).long(), minlength=len(counts)).double()
-        for h in hooks:
-            h.remove()
-        for key, _ in layers:
-            bases[key] = merge_nystrom_basis(acc[key], frames[key], k)
-        order = torch.argsort(counts, descending=True)
-    for key, _ in layers:
-        torch.distributed.broadcast(bases[key], 0)
-    torch.distributed.broadcast(order, 0)
-    return bases, order
-
-
-def subspace_move(name, move, bases, order):
-    if name in bases:
-        return (move @ bases[name]) @ bases[name].T
-    if name == 'transformer.wte.weight' or name.startswith('value_embeds.'):
-        mask = torch.zeros(move.shape[0], 1, device=move.device, dtype=move.dtype)
-        mask[order[:MERGE_TOKENS]] = 1
-        return move * mask
-    return move
-
-
-MERGE_COEFS = (0.75, 1.0)
-
-
-@torch.no_grad()
-def joint_parts(named, params, final, move, candidates, plain, scorer, settings, sweeps=2, shortlist=8):
-    parts = sorted({merge_part(n) for n, _ in named})
-    keys = [None] + [(rho, j, c) for rho, j in candidates for c in MERGE_COEFS]
-    cache = {}
-    def value(i, key):
-        if key is None:
-            return final[i]
-        if (i, key[0], key[1]) not in cache:
-            cache[i, key[0], key[1]] = move(i, key[0], key[1])
-        return final[i] + key[2] * cache[i, key[0], key[1]]
-    members = {}
-    for i, (n, _) in enumerate(named):
-        members.setdefault(merge_part(n), []).append(i)
-    held = dict.fromkeys(parts)
-    def show(choice):
-        for p in parts:
-            if held[p] != choice[p]:
-                for i in members[p]:
-                    params[i].copy_(value(i, choice[p]).to(params[i].dtype))
-                held[p] = choice[p]
-    def loss_for(trial, count):
-        show(trial)
-        return scorer.score(count)
-    best_key, best, global_losses, _ = race_merge_keys(
-      keys, None, plain, lambda key, count: loss_for(dict.fromkeys(parts, key), count),
-      settings.merge_screen_rows, HOLDOUT, settings.merge_screen_global)
-    choice = dict.fromkeys(parts, best_key)
-    keys = [None] + [k for _, k in sorted(global_losses, key=lambda x: x[0]) if k is not None][:settings.merge_keys]
-    ranked = {}
-    for sweep in range(sweeps):
-        for p in parts:
-            incumbent = choice[p]
-            candidates_p = keys if sweep == 0 else ranked[p]
-            def loss_of_key(key, count):
-                trial = dict(choice)
-                trial[p] = key
-                return loss_for(trial, count)
-            key, complete_loss, _, proxy_order = race_merge_keys(
-          candidates_p, incumbent, best, loss_of_key, settings.merge_screen_rows,
-          HOLDOUT, settings.merge_screen_coordinate)
-            choice[p], best = key, complete_loss
-            if sweep == 0:
-                ranked[p] = proxy_order[:shortlist]
-                if key not in ranked[p]:
-                    ranked[p].append(key)
-    show(choice)
-    return dict(holdout_plain=plain, holdout_merged=best,
-      merge_choices={p: (None if k is None else [k[0], MERGE_DECAYS[k[1]], k[2]])
-      for p, k in choice.items()})
-
-
-def holdout_sum(model, x, y):
-    with torch.autocast('cuda', dtype=torch.bfloat16):
-        return model(x, y, loss_reduction='sum')
-
-
-holdout_sum_captured = torch.compile(holdout_sum, dynamic=False)
-
-
-def score_merge_keys(keys, loss_of_key, count):
-    # Each score is an owned scalar clone, recorded before the next candidate writes.
-    losses = torch.stack([loss_of_key(key, count) for key in keys]).cpu().tolist()
-    if not all(math.isfinite(loss) for loss in losses):
-        raise RuntimeError('Non-finite merge scores')
-    return list(zip(losses, keys))
-
-
-def race_merge_keys(keys, incumbent, incumbent_full_loss, loss_of_key, screen_rows, full_rows, keep):
-    screened = score_merge_keys(keys, loss_of_key, screen_rows)
-    ranked = [key for _, key in sorted(screened, key=lambda item: item[0])]
-    finalists = ranked[:keep]
-    if incumbent not in finalists:
-        finalists.append(incumbent)
-    measured = dict((key, loss) for loss, key in score_merge_keys(
-      [key for key in finalists if key != incumbent], loss_of_key, full_rows))
-    complete = [(incumbent_full_loss if key == incumbent else measured[key], key) for key in finalists]
-    best_key, best_loss = incumbent, incumbent_full_loss
-    for loss, key in complete:
-        if loss < best_loss:
-            best_key, best_loss = key, loss
-    return best_key, best_loss, complete, ranked
-
-
-class ResidentMergeScore:
-    """Held-out loss on two fixed row cohorts (the screening rows and all held-out rows, split across ranks). Each
-    cohort's forward and all-reduce are captured once as a CUDA graph on random tokens before the timer; bind()
-    loads the held-out rows into the graph inputs."""
-    def __init__(self, model, rank, world, sequence_len, screen_rows):
-        self.model, self.rank, self.world = model, rank, world
-        self.device = next(model.parameters()).device
-        self.buffers, self.graphs = {}, {}
-        for count in (screen_rows, HOLDOUT):
-            shape = (count // world, sequence_len)
-            x = torch.zeros(shape, device=self.device, dtype=torch.long)
-            y = torch.zeros_like(x)
-            total = torch.zeros(2, device=self.device, dtype=torch.float64)
-            result = torch.zeros((), device=self.device, dtype=torch.float64)
-            self.buffers[count] = (x, y, total, result)
-
-    def bind(self, rows):
-        for count, (x, y, _, _) in self.buffers.items():
-            batch = rows[:count][self.rank::self.world].to(self.device)
-            x.copy_(batch[:, :-1])
-            y.copy_(batch[:, 1:])
-
-    def execute(self, count):
-        x, y, total, result = self.buffers[count]
-        total.zero_()
-        loss = holdout_sum_captured(self.model, x, y)
-        total[0].add_(loss.double())
-        total[1].add_(y.numel())
-        dist.all_reduce(total)
-        result.copy_(total[0] / total[1])
-
-    def capture(self):
-        for count in self.buffers:
-            side = torch.cuda.Stream()
-            side.wait_stream(torch.cuda.current_stream())
-            with torch.cuda.stream(side):
-                for _ in range(3):
-                    self.execute(count)
-            torch.cuda.current_stream().wait_stream(side)
-            torch.cuda.synchronize()
-            dist.barrier()
-            torch._C._cuda_clearCublasWorkspaces()
-            graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph, stream=side):
-                self.execute(count)
-            self.graphs[count] = graph
-        torch.cuda.synchronize()
-
-    def score(self, count):
-        self.graphs[count].replay()
-        return self.buffers[count][3].clone()
-
-    def close(self):
-        torch.cuda.synchronize()
-        self.graphs.clear()
-
-
-@torch.no_grad()
-def prepare_resident_merge_score(model, settings, rank, world):
-    noise = torch.randint(0, settings.model.vocab_size, (HOLDOUT, settings.model.sequence_len + 1),
-                          generator=torch.Generator().manual_seed(SEED + 270))
-    curvature_bases(model, noise, rank)  # random tokens; discarded
-    scorer = ResidentMergeScore(model, rank, world, settings.model.sequence_len, settings.merge_screen_rows)
-    scorer.bind(noise)
-    scorer.capture()
-    return scorer
-
-
-@torch.no_grad()
-def end_merge(model, means, rows, rank, scorer, settings):
-    scorer.bind(rows)
-    named = list(model.named_parameters())
-    params = [q for _, q in named]
-    final = [q.detach().float().clone() for q in params]
-    bases, order = curvature_bases(model, rows, rank) if any(rho < 1 for rho in MERGE_RHOS) else ({}, None)
-    candidates = [(rho, j) for rho in MERGE_RHOS for j in range(len(means))]
-    def move(i, rho, j):
-        full = means[j][i] - final[i]
-        if rho == 1.0:
-            return full
-        inside = subspace_move(named[i][0], full, bases, order)
-        return inside + rho * (full - inside)
-    plain = scorer.score(HOLDOUT).item()
-    return joint_parts(named, params, final, move, candidates, plain, scorer, settings, sweeps=settings.merge_sweeps)
+def fixed_merge(model, mean, coef):
+    """Every weight moves to final + coef x (mean - final) (fp32 lerp; bf16 weights cast back)."""
+    params = list(model.parameters())
+    wide = [i for i, q in enumerate(params) if q.dtype == F32]
+    torch._foreach_lerp_([params[i] for i in wide], [mean[i] for i in wide], coef)
+    cast = [i for i, q in enumerate(params) if q.dtype != F32]
+    if cast:
+        torch._foreach_copy_([params[i] for i in cast], torch._foreach_lerp(
+            [params[i].float() for i in cast], [mean[i] for i in cast], coef))
 
 
 F32, BF16 = torch.float32, torch.bfloat16
@@ -1850,7 +1974,9 @@ ANVIL_MAPS = ((3.923798038567, -6.095026865488, 3.905234618423), (3.278126713798
 POLAR_MARGIN = 1.1
 ANVIL_RUN = (1194, 240)  # #44's ANVIL momentum warmup: the first 240 of 1194 updates (see anvil_betas)
 SQUARE = ('attn.c_q', 'attn.c_k', 'attn.c_v', 'attn.c_proj')
-START_BLOCK, START_LAG, START_RHO, START_CONTENT = 1, 1, 0.8, 0.25
+START_BLOCK, START_LAG, START_RHO, START_CONTENT = 1, 1, 0.9, 0.1
+SPAN_STEP = 0.1  # the routed root's moves: its frame step x this (a routed row excites its unit ~sqrt(d) x a frame row)
+SPAN_RIDGE = 1e-4  # the routed root's per-token solve: ridge relative to its Gram's unit diagonal
 
 
 def id_has_ve(layer):
@@ -1887,8 +2013,7 @@ def pair_value_output(model):
         output.copy_(paired * (original_norm / paired.norm()))
 
 
-SHAPING_UPDATES = 195  # the four update-shaping mechanisms below act on identity updates 0..194
-SHAPING_ON = True  # (set while each graph is traced: False drops the mechanisms, a no-op from update 195 on)
+SHAPING_UPDATES = 195  # the four update-shaping mechanisms below act on identity updates 0..194 (all 175)
 VE_COMMON_GAIN = 4.0
 
 
@@ -1905,8 +2030,6 @@ WTE_GATE_ENERGY = 0.00390625  # 1/256 of each wte row's energy in its GATE_CHANN
 
 
 def constrain_wte_gate_energy(wte, step_t):
-    if not SHAPING_ON:
-        return
     x = wte.float()
     sector = torch.arange(D, device=x.device) < GATE_CHANNELS
     inside = torch.where(sector, x.square(), 0.0).sum(-1, keepdim=True)
@@ -1925,15 +2048,13 @@ constrain_wte_gate_energy_compiled = torch.compile(constrain_wte_gate_energy, dy
 def pool_gate_credits(grads, step_t):
     # Acts on the all-reduced gate credits, which feed only Adam: each VE gate's head-mean credit becomes the mean
     # over the four VE layers.
-    if not SHAPING_ON:
-        return
     common = torch.stack(grads).mean(dim=(0, 2))[:, None]
     for grad in grads:
         pooled = grad - grad.mean(dim=1, keepdim=True) + common
         grad.copy_(torch.where(step_t < SHAPING_UPDATES, pooled, grad))
 
 
-VE_PARTNER_GAIN = 0.5
+VE_PARTNER_GAIN = 1.0
 VE_PARTNERS = (2, 3, 0, 1)  # each VE layer's partner by index in VE_BLOCKS (1, 3, 5, 7): 1<->5, 3<->7
 
 
@@ -2568,15 +2689,14 @@ def adam_math(ps, gs, n: int, ms, vs, lrs: tuple, step_t, frames):
         v_new = BETA2 * v + (1 - BETA2) * g.square()
         if 8 <= index < 12:  # the value-embedding tables
             delta = lr * (m_new / c1) / (torch.sqrt(v_new) / torch.sqrt(c2) + ADAM_EPS)
-            if SHAPING_ON:
-                amplified = amplify_common_motion(delta)
-                delta = torch.where(step_t < SHAPING_UPDATES, amplified, delta)
+            amplified = amplify_common_motion(delta)
+            delta = torch.where(step_t < SHAPING_UPDATES, amplified, delta)
             value_deltas.append(delta)
         else:
             p.copy_((p.float() - lr * (m_new / c1) / (torch.sqrt(v_new) / torch.sqrt(c2) + ADAM_EPS)).to(p.dtype))
         m.copy_(m_new)
         v.copy_(v_new)
-    transferred = transfer_partner_motion(torch.stack(value_deltas), frames, step_t) if SHAPING_ON else value_deltas
+    transferred = transfer_partner_motion(torch.stack(value_deltas), frames, step_t)
     for i in range(4):
         ps[8 + i].copy_((ps[8 + i].float() - transferred[i]).to(ps[8 + i].dtype))
 
@@ -2626,20 +2746,6 @@ class IdentityPhase:
         self.graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(self.graph):
             train_step(model)
-        # the same step without the shaping mechanisms (no-ops from update SHAPING_UPDATES on)
-        global SHAPING_ON
-        SHAPING_ON = False
-        try:
-            with torch.cuda.stream(side):
-                for _ in range(2):
-                    train_step(model)
-            torch.cuda.current_stream().wait_stream(side)
-            torch.cuda.synchronize()
-            self.plain_graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(self.plain_graph, pool=self.graph.pool()):
-                train_step(model)
-        finally:
-            SHAPING_ON = True
         # Restore the fresh state: weights, optimizer state, bf16 copies and the update counter.
         with torch.no_grad():
             for x, saved in zip(model.tensors(), snapshot):
@@ -2658,7 +2764,8 @@ class IdentityPhase:
         """config.json "identity" entry. schedule_updates is the planned length that scales ANVIL's momentum warm-up;
         a shaping mechanism with `until` acts on identity updates 0..until-1."""
         return dict(updates=IDENTITY_UPDATES, schedule_updates=IDENTITY_SCHEDULE, batch=BATCH, sequence_len=ID_SEQ_LEN,
-        init='prev8', value_output_pairing=dict(layers=list(range(L)), free_after_init=True),
+        init='prev8', init_rho=START_RHO, init_content=START_CONTENT,
+        value_output_pairing=dict(layers=list(range(L)), free_after_init=True),
         wte_gate_energy=dict(energy=WTE_GATE_ENERGY, channels=GATE_CHANNELS, init=True, until=SHAPING_UPDATES),
         value_embed_common_gain=dict(gain=VE_COMMON_GAIN, until=SHAPING_UPDATES),
         gate_credit_pooling=dict(layers=list(VE_BLOCKS), shared_component='head_mean_credit_only',
@@ -2667,29 +2774,79 @@ class IdentityPhase:
         lr=LR, betas=[BETA1, BETA2], lr_wte=LR_WTE, lr_value_embeds=LR_VE, lr_lambdas=LR_LAMBDAS,
         anvil_lr=ANVIL_LR, anvil_wd=ANVIL_WD)
     def run(self):
-        for i in range(IDENTITY_UPDATES):
-            (self.plain_graph if i >= SHAPING_UPDATES else self.graph).replay()
+        for _ in range(IDENTITY_UPDATES):  # (the shaping mechanisms are exact no-ops from update SHAPING_UPDATES on)
+            self.graph.replay()
         self.model.gather_fp32()
     def close(self):
-        self.graph = self.plain_graph = None
+        self.graph = None
         self.model = None
         torch.cuda.empty_cache()
 
 
 def difficulty_order(rows, settings):
-    n, batch = (len(rows), settings.cut_batch)
-    token_ids = rows.numpy()[:, 1:]
-    counts = np.bincount(token_ids.reshape(-1), minlength=settings.model.vocab_size)
-    surprisal = -np.log((counts.astype(np.float64) + 1.0) / (counts.sum() + len(counts)))
-    score = np.empty(n, dtype=np.float64)
-    for start in range(0, n, 256):
-        score[start:start + 256] = surprisal[token_ids[start:start + 256]].mean(axis=1)
+    """The Cut rows' order (rows on the GPU): runs of cut_batch rows, one from each mean-surprisal stratum, then the
+    pruned rows (past train_count: unused). Reads only the Cut rows' tokens."""
+    batch, token_ids = settings.cut_batch, rows[:, 1:]
+    n, m = token_ids.shape
+    counts = torch.bincount(token_ids.reshape(-1), minlength=settings.model.vocab_size).double()
+    surprisal = -torch.log((counts + 1.0) / (counts.sum() + counts.numel()))
+    score = surprisal[token_ids].mean(dim=1).cpu().numpy()
+    # pruned: the rows furthest from the Cut rows' add-one unigram mix, KL(row || unigram) = sum_v p log p + score
+    row_counts = torch.zeros(n, settings.model.vocab_size, device=rows.device)
+    row_counts.scatter_add_(1, token_ids, torch.ones(token_ids.shape, device=rows.device))
+    xlogx = (row_counts * row_counts.clamp_min(1).log()).sum(1, dtype=torch.float64).cpu().numpy()
+    dropped = np.argsort(score - math.log(m) + xlogx / m, kind='stable')[n - pruned_count(settings, n):]
+    keep = np.ones(n, dtype=bool)
+    keep[dropped] = False
     ordered = np.argsort(score, kind='stable')
+    ordered = ordered[keep[ordered]]
     rng = np.random.default_rng(SEED)
-    strata = ordered.reshape(batch, n // batch)
+    strata = ordered.reshape(batch, len(ordered) // batch)
     plan = np.stack([rng.permutation(group) for group in strata], axis=1)
     plan = np.take_along_axis(plan, np.argsort(rng.random(plan.shape), axis=1), axis=1)
-    return plan.reshape(-1)
+    return np.concatenate([plan.reshape(-1), dropped])
+
+
+def pruned_count(settings, rows: int):
+    """The pruned rows' count, fixed before the timer (the horizon depends on it): ROW_PRUNE x rows, rounded down to
+    whole updates of the largest batch."""
+    per_update = settings.cut_batch * max(r for _, r, _ in row_stages(settings))
+    return int(ROW_PRUNE * rows) // per_update * per_update
+
+
+def row_stages(settings):
+    """The batch's stages, (share of the horizon, cut_rows, rate scale) each: with cut_rows_from, half the rows per rank
+    at rate 1, then cut_rows at cut_rows_rate from that share of the horizon on; else cut_rows at cut_rows_rate."""
+    if settings.cut_rows_from:
+        return [(0.0, settings.cut_rows // 2, 1.0), (settings.cut_rows_from, settings.cut_rows, settings.cut_rows_rate)]
+    return [(0.0, settings.cut_rows, settings.cut_rows_rate)]
+
+
+def stage_settings(settings, rows, k=0):
+    """Stage k's Cut settings: rows per rank (x cut_batch / world) fixed, no growth; its chain_fraction_stages entry."""
+    fraction = settings.chain_fraction_stages[k] if settings.chain_fraction_stages else settings.chain_fraction
+    return replace(settings, cut_rows=rows, cut_rows_from=0.0, chain_fraction=fraction, chain_fraction_stages=())
+
+
+def row_plan(settings, rows: int):
+    """The Cut horizon and row offsets of a batch that grows in stages (row_stages). Returns (horizon, switches,
+    rows_before): stage k runs updates switches[k - 1] + 1..switches[k] (switches[k - 1] = round(its share x horizon))
+    at cut_batch x its cut_rows rows each; rows_before(step) is the rows the first `step` updates take (the longest
+    horizon whose rows fit)."""
+    stages = row_stages(settings)
+    shares = [share for share, _, _ in stages] + [1.0]
+    sizes = [settings.cut_batch * r for _, r, _ in stages]  # rows per update
+    starts = lambda h: [round(f * h) for f in shares[:-1]]
+    def before(step, h):
+        bounds = starts(h) + [step]
+        return sum(max(min(step, bounds[k + 1]) - bounds[k], 0) * n for k, n in enumerate(sizes))
+    mean = 0.0  # rows per update, averaged over the horizon
+    for k, n in enumerate(sizes):
+        mean += (shares[k + 1] - shares[k]) * n
+    horizon = int(rows / mean) + 1
+    while before(horizon, horizon) > rows:
+        horizon -= 1
+    return horizon, starts(horizon)[1:], lambda step: before(step, horizon)
 
 
 def train_stages(args, settings, device, rank, world):
@@ -2702,11 +2859,16 @@ def train_stages(args, settings, device, rank, world):
     keep[identity_indices] = False
     indices = torch.arange(TRAIN_ROWS)[keep]
     indices = indices[torch.randperm(len(indices), generator=torch.Generator().manual_seed(SEED + 1))]
-    holdout_indices, train_indices = indices[-HOLDOUT:], indices[:-HOLDOUT]
-    means = None
-    horizon = len(train_indices) // settings.cut_batch  # every remaining row: 14648 - 8*300 - 64 = 8*1523
+    holdout_indices, train_indices = indices[-HOLDOUT:], indices[:-HOLDOUT]  # (the held-out rows go unused)
+    mean = None
+    # the remaining rows, 14648 - 8 x 175 - 64 = 13184, less 192 pruned: 12992 = 542 updates of 8 rows + 541 of 16
+    stages = row_stages(settings)  # (cut_rows_from: a growing batch, one Cut and estimate graph per stage)
+    per_update = settings.cut_batch * max(rows for _, rows, _ in stages)  # (the largest batch)
+    pruned = pruned_count(settings, len(train_indices))  # (picked in the timer, left unused)
+    horizon, switches, rows_before = row_plan(settings, len(train_indices) - pruned)
+    stage_of = lambda step: bisect.bisect_left(switches, step)  # the stage of update step
     stop = min(args.steps or horizon, horizon)
-    train_count = stop * settings.cut_batch
+    train_count = rows_before(stop)
     if rank == 0:
         if args.output.exists() and any(args.output.iterdir()):
             raise FileExistsError(f'Choose an empty output directory: {args.output}')
@@ -2720,22 +2882,33 @@ def train_stages(args, settings, device, rank, world):
                     train_rows=train_count + IDENTITY_UPDATES * BATCH,
                     upstream='qlabs-eng/noise@3343973b6f1af119effcdea2622f1fe672c51b1e',
                     additions=[
-                        'identity_handoff_at_355', 'identity_init_and_early_update_shaping',
+                        'identity_handoff_at_175', 'identity_init_and_early_update_shaping',
                         'difficulty_balanced_row_order', 'single_chain_roots_4_6', 'reduced_forward_replay',
                         'diagonal_readout_moments', 'x0_skip_embedding_credit', 'fused_forward_kernels',
-                        'late_zero_anvil_decay', 'screened_merge', 'cut_key_degree2_moments',
+                        'late_zero_anvil_decay', 'fixed_merge_ema_004_coef_075', 'cut_key_degree2_moments',
                         'cut_query_degree2_moments', 'readout_probe_moments', 'factored_query_replay',
-                        'cut_mixing_scalar_contraction', 'cut_estimate_cuda_graph', 'resident_merge_scorer',
+                        'cut_mixing_scalar_contraction', 'cut_estimate_cuda_graph',
                         'response_ranked_mlp_routes', 'batched_update_telemetry', 'fused_gluon_chain_kernels',
-                        'sharded_anvil_bf16_async_collectives', 'split_identity_graph',
+                        'sharded_anvil_bf16_async_collectives',
+                        'root4_on_3_16_then_7_16_of_tokens_importance_drawn_with_root6_credit_as_control',
+                        'block5_strong_keys_on_root4_tokens_only',
+                        'root6_moves_along_its_routed_span_cg_decode',
+                        'batch_8_rows_then_16_rows_from_half_horizon_at_1_42x_rates',
+                        'anvil_cuda_graphs_and_overlapped_update_tail',
+                        'start_init_rho_09_content_01_partner_gain_1',
+                        'kl_pruned_1_5pct_of_cut_rows', 'difficulty_order_on_gpu_beside_identity_phase',
+                        'warp_specialized_gluon_moment_kernels', 'leaner_chain_kernels',
                     ],
                     torch_version=torch.__version__,
-                    merge_sketch=dict(columns=MERGE_SKETCH_COLUMNS, output_rank=MERGE_K, seed=SEED),
+                    merge=dict(decay=MERGE_DECAY, coef=MERGE_COEF, every=MERGE_EVERY, from_rows=MERGE_FROM),
+                    row_prune=dict(rule='kl', share=ROW_PRUNE, rows=pruned),
                     identity=identity.config(),
                     cut_anvil_decay=dict(
                         early_multiplier=1.0, late_multiplier=settings.late_cut_decay_multiplier,
                         late_after_updates=round(275 / 1043 * horizon), horizon=horizon,
                     ),
+                    cut_stages=[dict(from_update=round(share * horizon) + 1, rows_per_update=settings.cut_batch * rows,
+                                     rate_scale=rate) for share, rows, rate in stages],
                 ),
                 indent=2,
             )
@@ -2748,13 +2921,14 @@ def train_stages(args, settings, device, rank, world):
         return batch[first : first + per].to(device)
 
     # Compile Cut's update on random tokens with a throwaway model, optimizer and Cut. The timed ones are rebuilt from
-    # seed below, and the timed Cut captures its estimate graph on the same tokens.
-    noise = torch.randint(0, settings.model.vocab_size, (settings.cut_batch, settings.model.sequence_len + 1),
+    # seed below, and the timed Cuts capture their estimate graphs on the same tokens.
+    noise = torch.randint(0, settings.model.vocab_size, (per_update, settings.model.sequence_len + 1),
                           generator=torch.Generator().manual_seed(SEED))
     model = make_model(device, SEED, settings.model)
     optimizer = make_optimizer(model, settings, horizon)
-    estimator = Cut(model, settings, SEED, rank, world)
-    batch = rank_slice(noise)
+    early = stage_settings(settings, stages[0][1])
+    estimator = Cut(model, early, SEED, rank, world)
+    batch = rank_slice(noise[:settings.cut_batch * stages[0][1]])
     inp, target = batch[:, :-1].contiguous(), batch[:, 1:].contiguous()
     for _ in range(4):
         estimator.step(inp, target, optimizer)
@@ -2766,64 +2940,77 @@ def train_stages(args, settings, device, rank, world):
     model = make_model(device, SEED, settings.model)
     optimizer, estimator = (
         make_optimizer(model, settings, horizon),
-        Cut(model, settings, SEED, rank, world),
+        Cut(model, early, SEED, rank, world),
     )
-    graph_batch = rank_slice(noise)
+    graph_batch = rank_slice(noise)[:settings.cut_batch * estimator.s.cut_rows // world]  # (the estimate graph's rows)
+    optimizer.optimizers[0].capture_graphs(world, torch.bfloat16)  # (the throwaway Cut's steps compiled their code)
     estimator.bind_flat_layout(optimizer)  # (the graph packs the gradients in step's layout)
     estimator.capture_estimate_graph(graph_batch[:, :-1].contiguous(), graph_batch[:, 1:].contiguous())
+    cuts = [estimator]
+    for k, (_, rows, _) in enumerate(stages[1:], 1):  # each later stage's estimate: its own Cut, generators and graph,
+        # sharing the model and optimizer (captured the same way: no weight or optimizer state changes, every generator
+        # it draws from restored)
+        cuts[-1].capture.close()  # (the previous Cut's module hooks; its graph is captured)
+        late = Cut(model, stage_settings(settings, rows, k), SEED + 7 * k, rank, world)
+        late._telemetry_health = estimator._telemetry_health  # (one finite check for all)
+        late.bind_flat_layout(optimizer)
+        graph_batch = rank_slice(noise)[:settings.cut_batch * late.s.cut_rows // world]
+        late.capture_estimate_graph(graph_batch[:, :-1].contiguous(), graph_batch[:, 1:].contiguous())
+        cuts.append(late)
+    cut_at = lambda step: cuts[stage_of(step)]  # the Cut of update step
     log = (args.output / 'metrics.jsonl').open('w') if rank == 0 else None
-    scorer = prepare_resident_merge_score(model, settings, rank, world)
     del noise, graph_batch
     # Untimed, as in #44 (qlabs-eng/noise@3343973b, train_stages): read train.pt, split it by the seeded permutations
-    # above and put the identity phase's batches on the GPU. No split or order here depends on the rows' contents;
-    # load_rows only verifies their pinned hash.
+    # above and put the identity phase's batches and the (unordered) Cut rows on the GPU. No split or order here
+    # depends on the rows' contents; load_rows only verifies their pinned hash.
     all_rows = load_rows(args.data_dir / 'train.pt', TRAIN_ROWS)
-    cut_rows = all_rows.index_select(0, train_indices)
-    holdout_rows = all_rows.index_select(0, holdout_indices)
+    cut_rows = all_rows.index_select(0, train_indices).to(device)
     identity.bind_rows(all_rows.numpy())
     del all_rows
+    # the Cut rows' stream (their order and gather) and the averages' stream
+    copier, averager = torch.cuda.Stream(), torch.cuda.Stream()
+    marks = [torch.cuda.Event(enable_timing=True) for _ in range(2)]
     torch.cuda.reset_peak_memory_stats()
     begin_training()
     start = time.perf_counter()
     try:
-        order = torch.from_numpy(difficulty_order(cut_rows, settings))  # timed: it reads the rows' tokens
-        train_indices = train_indices[order]
-        unused_indices = train_indices[train_count:]
-        train_indices = train_indices[:train_count]
-        training = cut_rows.index_select(0, order[:train_count])
-        del cut_rows
-        training = training.to(device)
-        all_used = torch.cat([identity_indices, train_indices, holdout_indices, unused_indices])
-        assert len(torch.unique(all_used)) == len(all_used) == TRAIN_ROWS
-        if rank == 0:
-            digest = lambda ids: hashlib.sha256(ids.numpy().tobytes()).hexdigest()
-            usage = dict(identity_rows=len(identity_indices), cut_rows=train_count, merge_rows=len(holdout_indices),
-                         unused_rows=len(unused_indices), unused_sha256=digest(unused_indices), disjoint=True,
-                         identity_sha256=digest(identity_indices), cut_sha256=digest(train_indices),
-                         merge_sha256=digest(holdout_indices))
-            (args.output / 'row_usage.json').write_text(json.dumps(usage, indent=2) + '\n')
+        # queue the identity phase first; the Cut rows are ordered on a side stream beside its graph's replays
+        marks[0].record()
         identity.run()
         with torch.no_grad():
             weights = model.state_dict()
             for name, value in identity.model.state_dict().items():
                 weights[name].copy_(value)
-        identity_loss = average_ranks(identity.model.loss.clone()).item()
-        identity.close()
-        torch.cuda.synchronize()
-        elapsed = time.perf_counter() - start
-        record = dict(step=IDENTITY_UPDATES, phase='identity', phase_step=IDENTITY_UPDATES,
-                      seqs=IDENTITY_UPDATES * BATCH, tokens=IDENTITY_UPDATES * BATCH * settings.model.sequence_len,
-                      train_loss=identity_loss, train_seconds=round(elapsed, 2))
+        identity_loss = average_ranks(identity.model.loss.clone()).reshape(())  # read at the first flush
+        marks[1].record()
+        with torch.cuda.stream(copier):
+            order = torch.from_numpy(difficulty_order(cut_rows, settings))  # timed: it reads the rows' tokens
+            training = cut_rows.index_select(0, order[:train_count].to(device))
+        train_indices = train_indices[order]
+        unused_indices = torch.cat([train_indices[train_count:], holdout_indices])  # (pruned and held-out rows: unused)
+        train_indices = train_indices[:train_count]
+        all_used = torch.cat([identity_indices, train_indices, unused_indices])
+        assert len(torch.unique(all_used)) == len(all_used) == TRAIN_ROWS
         if rank == 0:
-            print(json.dumps(record), flush=True)
-            log.write(json.dumps(record) + '\n')
-            log.flush()
-        pending_records = []
+            digest = lambda ids: hashlib.sha256(ids.numpy().tobytes()).hexdigest()
+            usage = dict(identity_rows=len(identity_indices), cut_rows=train_count, merge_rows=0,
+                         unused_rows=len(unused_indices), unused_sha256=digest(unused_indices), disjoint=True,
+                         identity_sha256=digest(identity_indices), cut_sha256=digest(train_indices),
+                         pruned_rows=pruned)  # (among the unused rows)
+            (args.output / 'row_usage.json').write_text(json.dumps(usage, indent=2) + '\n')
+        # no host sync or empty_cache at the hand-off: the identity row is logged at the first flush and the identity
+        # phase closed after the timer
+        torch.cuda.current_stream().wait_stream(copier)
+        training.record_stream(torch.cuda.current_stream())
+        pending_records = [dict(step=IDENTITY_UPDATES, phase='identity', phase_step=IDENTITY_UPDATES,
+                                seqs=IDENTITY_UPDATES * BATCH,
+                                tokens=IDENTITY_UPDATES * BATCH * settings.model.sequence_len, train_loss=identity_loss)]
         for step in range(1, stop + 1):
-            begin, end = (step - 1) * settings.cut_batch, step * settings.cut_batch
-            set_rate(optimizer, step, horizon, settings.warmdown, settings.final, settings.cut_warmup)
+            begin, end = rows_before(step - 1), rows_before(step)
+            set_rate(optimizer, step, horizon, settings.warmdown, settings.final, settings.cut_warmup,
+                     stages[stage_of(step)][2])
             batch = rank_slice(training[begin:end])
-            loss = estimator.step(batch[:, :-1].contiguous(), batch[:, 1:].contiguous(), optimizer)
+            loss = cut_at(step).step(batch[:, :-1].contiguous(), batch[:, 1:].contiguous(), optimizer)
             record = dict(step=step + IDENTITY_UPDATES, phase='cut', phase_step=step,
                           seqs=end + IDENTITY_UPDATES * BATCH,
                           tokens=(end + IDENTITY_UPDATES * BATCH) * settings.model.sequence_len, train_loss=loss,
@@ -2835,39 +3022,49 @@ def train_stages(args, settings, device, rank, world):
                     raise FloatingPointError('Non-finite estimator credit')
                 estimator._telemetry_health.clear()
                 losses = torch.stack([entry['train_loss'] for entry in pending_records])
+                # the Cut records hold this rank's loss: the ranks' mean in one all-reduce
+                local = torch.tensor([entry['phase'] == 'cut' for entry in pending_records], device=losses.device)
+                losses = torch.where(local, average_ranks(torch.where(local, losses, 0)), losses)
                 losses = losses.cpu().tolist()
                 if any(not math.isfinite(value) for value in losses):
                     raise FloatingPointError('Non-finite training loss')
                 torch.cuda.synchronize()
                 elapsed = time.perf_counter() - start
+                if pending_records[0]['phase'] == 'identity':  # the identity phase's GPU time
+                    pending_records[0]['train_seconds'] = round(marks[0].elapsed_time(marks[1]) / 1000, 2)
                 for entry, measured_loss in zip(pending_records, losses):
                     entry['train_loss'] = measured_loss
-                    entry['train_seconds'] = round(elapsed, 2)
+                    entry.setdefault('train_seconds', round(elapsed, 2))
                 if rank == 0:
                     records_text = ''.join(json.dumps(entry) + '\n' for entry in pending_records)
                     print(records_text, end='', flush=True)
                     log.write(records_text)
                     log.flush()
                 pending_records.clear()
-            # Weight averages for the end merge: every MERGE_EVERY updates (and the last) from MERGE_FROM of the rows on.
+            # The end merge's weight average: every MERGE_EVERY updates (and the last) from MERGE_FROM of the rows on.
             if (step % MERGE_EVERY == 0 or step == stop) and begin / len(training) >= MERGE_FROM:
                 with torch.no_grad():
-                    if means is None:
-                        means = [[q.detach().float().clone() for q in model.parameters()] for _ in MERGE_DECAYS]
-                    else:
-                        for a, mean in zip(MERGE_DECAYS, means):
-                            for m, q in zip(mean, model.parameters()):
-                                m.lerp_(q.detach().float(), a)
+                    if mean is None:
+                        mean = [q.detach().float().clone() for q in model.parameters()]
+                    else:  # one multi-tensor lerp, on a side stream under the next estimate
+                        averager.wait_stream(torch.cuda.current_stream())
+                        with torch.cuda.stream(averager):
+                            current = [q.detach().float() for q in model.parameters()]
+                            torch._foreach_lerp_(mean, current, MERGE_DECAY)
+                            cut_at(step + 1).weights_read = averager.record_event()  # (next step's)
+                        del current
         extra = {}
-        if means:
+        torch.cuda.current_stream().wait_stream(averager)
+        if mean:
             merge_start = time.perf_counter()
-            extra.update(end_merge(model, means, holdout_rows, rank, scorer, settings))
+            fixed_merge(model, mean, MERGE_COEF)
             torch.cuda.synchronize()
             extra['merge_seconds'] = round(time.perf_counter() - merge_start, 2)
-            means = None
+            mean = None
         torch.cuda.synchronize()
         elapsed = time.perf_counter() - start
         end_training()
+        identity.close()
         state = {name: value.detach().cpu() for name, value in model.state_dict().items()}
         result = dict(
             val_loss=evaluate(state, args.data_dir), train_seconds=round(elapsed, 2), steps=stop + IDENTITY_UPDATES,
@@ -2881,8 +3078,8 @@ def train_stages(args, settings, device, rank, world):
             (args.output / 'result.json').write_text(json.dumps(result, indent=2) + '\n')
             print(json.dumps(result), flush=True)
     finally:
-        scorer.close()
-        estimator.close()
+        for cut in cuts:
+            cut.close()
         if log is not None:
             log.close()
 
@@ -2907,10 +3104,13 @@ def main():
             value = ast.literal_eval(text)
         except (ValueError, SyntaxError):
             value = text
-        if key.isupper():
-            if key not in globals():
+        if key.isupper():  # this file's, or a kernel module's
+            owner = next((m for m in (sys.modules[__name__], visit_gluon_root, visit_chain, visit_chain3,
+                                      query_factored_gluon, window_topk, project_values, moment_kernels, span_solve)
+                          if hasattr(m, key)), None)
+            if owner is None:
                 parser.error(f'unknown constant {key}')
-            globals()[key] = value
+            setattr(owner, key, value)
         else:
             if not hasattr(settings, key):
                 parser.error(f'unknown setting {key}')

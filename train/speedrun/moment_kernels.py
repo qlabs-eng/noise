@@ -26,6 +26,11 @@ import triton.language as tl
 from triton.language.extra import libdevice
 
 PREC = 'tf32'  # run.py's KEY_DOT_PRECISION
+# warp-specialized Gluon kernels, bitwise the Triton kernels' numbers; the Triton kernels stay for the calls they do
+# not take (and with the switch at 0)
+ATTN_WS = 1  # moment_query_scores_into's OUT_H path on moment_queries_ws.py: 1 persistent CTAs, 2 one per item
+KEY_WS = 3  # tf32: bit 1 the key scan without value credits (key_scan_ws.py), bit 2 lse / center (implicit_ws.py)
+VALUE_WS = 1  # the value credits (_value_pass, head_dim 64) on value_credit_ws.py: 1 persistent CTAs, 2 one per item
 # measured (bench.py, one H100, CUDA graph replay)
 IMPLICIT_CONFIG = dict(BM=64, BN=64, num_warps=4, num_stages=2)
 MOMENT_CONFIG = dict(PAIRS=16, BLOCK_T=32, BLOCK_S=64, num_warps=4, num_stages=3)
@@ -133,6 +138,10 @@ def _implicit_key_statistics_edges(Q, K, Values, Hub, LSE, Center, T: tl.constex
 
 def _implicit_key_context(q: torch.Tensor, k: torch.Tensor, values: torch.Tensor, hub: torch.Tensor,
                           window: int) -> tuple[torch.Tensor, torch.Tensor]:
+    if KEY_WS & 2 and PREC == 'tf32':
+        import implicit_ws
+        if implicit_ws.supported(q, window):
+            return implicit_ws.implicit_key_context_ws(q, k, values, hub, window)
     h, t, _ = q.shape
     q, k, values, hub = (z.contiguous() for z in (q, k, values, hub))
     lse = torch.empty((h, t), device=q.device)
@@ -288,6 +297,10 @@ def _moment_query_scores(q, k, v, hub, raw, sq, side, cos, sin, lse, hub_out, st
     c = MOMENT_CONFIG
     assert repeat == 4 and d == 64, 'the reference call (repeat = head_dim // 16)'
     parts = d // 2 // c['PAIRS']
+    if ATTN_WS and out_heads:
+        from moment_queries_ws import moment_query_scores_ws
+        return moment_query_scores_ws(q, k, v, hub, raw, sq, side, cos, sin, lse, hub_out, steps, out,
+                                      t if window is None else min(window, t), out_heads, layers, ATTN_WS == 1)
     f2, f4, xy = _pair_operands(side.contiguous())
     m, out_blk, w_stride = (t, 0, 0) if out_heads else (out.shape[2], out.stride(1), out.stride(0))
     assert not out_heads or out.stride(2) == 1
@@ -526,6 +539,13 @@ def _key_scan(qp, kp, k_raw, lse, values, hub, center, cos, sin, window, sigma, 
     assert key.shape[1:] == shape[1:] and key.stride(2) == 1 and (layers is not None or key.shape == shape)
     raw_value = k_raw.new_empty(shape) if with_values else key
     c = KEY_CONFIG
+    if KEY_WS & 1 and not with_values and PREC == 'tf32':
+        import key_scan_ws
+        if key_scan_ws.supported(qp, kp, k_raw, lse, values, hub, center, cos, sin):
+            key_scan_ws.key_scan_ws(qp, kp, k_raw, lse, values, hub, center, cos, sin, window, sigma, key, out_heads,
+                                    layers)
+            key = key.view(h, t, d) if out_heads == 1 else key
+            return key, key
     _key_scan_kernel[h, t // c['BT']](qp, kp, k_raw, lse, values, hub, center, cos, sin, key, raw_value,
         key.stride(0), key.stride(1), raw_value.stride(0), raw_value.stride(1), key if layers is None else layers,
         T=t, D=d, OUT_MAPPED=layers is not None,
@@ -593,6 +613,10 @@ def _value_pass(q, k, lse, source, window, in_heads=1, out_heads=1, out=None, la
     channels = source.shape[-1] // in_heads
     out = source.new_empty((h // out_heads, t, out_heads * channels)) if out is None else out
     assert source.stride(2) == 1 and out.stride(2) == 1
+    if VALUE_WS and q.shape[-1] == channels == 64 and t % 128 == 0 and all(
+            z.is_contiguous() for z in (q, k, lse, source)):
+        from value_credit_ws import value_pass_ws
+        return value_pass_ws(q, k, lse, source, window, in_heads, out_heads, out, layers, VALUE_WS == 1)
     c = VALUE_CONFIG[channels]
     _value_credit_kernel[h, t // c['BT']](q, k, lse, source, out, T=t, Window=window, BT=c['BT'], BS=c['BS'],
         Channels=channels, PREC=PREC, IN_H=in_heads, OUT_H=out_heads, IN_LAYER=source.stride(0),

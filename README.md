@@ -92,6 +92,7 @@ to `logs/`. `uv run utils/eval.py logs/val/final.pt` rescores a checkpoint.
 | 2 | 3.499 | The identity path first, then Cut-lite at 8 rows per update with faster chain reruns | 8 min 20 s | [Script](https://github.com/qlabs-eng/noise/blob/4586b02e7f77927683c1f5d28a981b3a0342b9ea/train/speedrun/run.py) | [@RobertTLange](https://github.com/RobertTLange) |
 | 3 | 3.494 | A shorter identity phase, then Cut with paired MLP roots and a difficulty-balanced row order | 2 min 3 s | [Script](https://github.com/qlabs-eng/noise/blob/8be79219cf53d409060261477cf54ce8f1a03a28/train/speedrun/run.py) | [@conglu1997](https://github.com/conglu1997) |
 | 4 | 3.498 | #3's identity phase, then Cut with two single roots, fused Gluon chain kernels and overlapped bf16 collectives | 22.9 s | [Script](https://github.com/qlabs-eng/noise/blob/4f046549915122842092b9c92f7513833455ab3b/train/speedrun/run.py) | [@RobertTLange](https://github.com/RobertTLange) |
+| 5 | 3.496 | #4 with root 4 on importance-drawn tokens (root 6 as its control), root 6 along its routed span, 16 rows per update in the second half, overhead in CUDA graphs, a fixed end merge, word-mix row pruning, warp-specialized attention kernels | 15.9 s | [Script](train/speedrun/run.py) | [@CharlesDDDD](https://github.com/CharlesDDDD) |
 
 ### Track 3: open architecture (30M)
 
