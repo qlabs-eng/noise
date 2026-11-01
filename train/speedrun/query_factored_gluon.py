@@ -21,7 +21,8 @@ from triton.experimental.gluon.nvidia.hopper import TensorDescriptor
 
 from query_gluon import EPS, _replay_pair, interleave_wq
 
-CONFIG = dict(BM=64, TOK=8, STAGES=1, num_warps=4)  # one TMA stage: 49 KB, 4 CTAs/SM (two stages, 3 CTAs: 0.78 ms)
+# one TMA stage: 49 KB, 4 CTAs/SM (two stages, 3 CTAs: 0.78 ms); TOK 2 tokens per CTA (bitwise the same as 8, faster)
+CONFIG = dict(BM=64, TOK=2, STAGES=1, num_warps=4)
 
 
 @gluon.jit
