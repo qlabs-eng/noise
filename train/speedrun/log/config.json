@@ -1,5 +1,5 @@
 {
-  "script": "/tmp/claude-chunyuan/port/wt/train/speedrun/run.py",
+  "script": "/home/robert_sakana_ai/dust-repro/speedrun_jobs/fw30m/tsnap/1a47231/train/speedrun/run.py",
   "world": 8,
   "seed": 0,
   "recipe": {
@@ -14,22 +14,22 @@
     },
     "late_cut_decay_multiplier": 0.0,
     "cut_batch": 8,
-    "cut_rows": 2,
-    "cut_rows_from": 0.5,
-    "cut_rows_rate": 1.42,
+    "wide_rows": 16,
+    "wide_from": 0.1,
+    "wide_lr_scale": 1.3,
+    "wide_anvil_scale": 1.3,
     "lr": 0.0028,
     "betas": [
       0.5,
       0.98
     ],
-    "warmdown": 0.5,
-    "cut_warmup": 0,
+    "warmdown": 0.55,
     "final": 0.5,
     "anvil_lr": 0.036,
     "anvil_wd": 2.25,
-    "fast_weight": 0.75,
+    "fast_weight": 1.0,
     "polar_margin": 1.1,
-    "telemetry_batch": 1468,
+    "telemetry_batch": 16,
     "fc_sigma": 0.05,
     "route_k_late": 64,
     "route_split": 2,
@@ -39,22 +39,14 @@
       4,
       6
     ],
-    "chain_fraction": [
-      0.375,
-      1.0
-    ],
-    "chain_fraction_stages": [
+    "joint_root_groups": [
       [
-        0.1875,
-        1.0
+        4
       ],
       [
-        0.4375,
-        1.0
+        6
       ]
     ],
-    "chain_pps_floor": 0.4,
-    "span_cg": 16,
     "route_k": 128,
     "chain_tokens": 2048,
     "query_replay_long_layers": [
@@ -66,63 +58,50 @@
     "emb_scale": 750.0,
     "lambda_scale": 15.0
   },
-  "steps": 1258,
+  "steps": 1145,
   "overrides": [],
-  "epoch_updates": 1258,
-  "train_rows": 14392,
+  "epoch_updates": 1823,
+  "train_rows": 14584,
   "upstream": "qlabs-eng/noise@3343973b6f1af119effcdea2622f1fe672c51b1e",
   "additions": [
-    "identity_handoff_at_175",
+    "identity_handoff_at_315",
     "identity_init_and_early_update_shaping",
+    "identity_rate_decay",
     "difficulty_balanced_row_order",
     "single_chain_roots_4_6",
+    "amortized_block4_root",
     "reduced_forward_replay",
     "diagonal_readout_moments",
     "x0_skip_embedding_credit",
     "fused_forward_kernels",
     "late_zero_anvil_decay",
-    "fixed_merge_ema_004_coef_075",
+    "in_run_part_merge",
     "cut_key_degree2_moments",
     "cut_query_degree2_moments",
     "readout_probe_moments",
     "factored_query_replay",
     "cut_mixing_scalar_contraction",
     "cut_estimate_cuda_graph",
+    "resident_merge_scorer",
     "response_ranked_mlp_routes",
     "batched_update_telemetry",
     "fused_gluon_chain_kernels",
+    "gluon_key_value_kernels",
+    "bf16_weight_credits",
     "sharded_anvil_bf16_async_collectives",
-    "root4_on_3_16_then_7_16_of_tokens_importance_drawn_with_root6_credit_as_control",
-    "block5_strong_keys_on_root4_tokens_only",
-    "root6_moves_along_its_routed_span_cg_decode",
-    "batch_8_rows_then_16_rows_from_half_horizon_at_1_42x_rates",
-    "anvil_cuda_graphs_and_overlapped_update_tail",
-    "start_init_rho_09_content_01_partner_gain_1",
-    "kl_pruned_1_5pct_of_cut_rows",
-    "difficulty_order_on_gpu_beside_identity_phase",
-    "warp_specialized_gluon_moment_kernels",
-    "leaner_chain_kernels"
+    "rank_major_anvil_graphs",
+    "joint_qk_head_polar",
+    "split_identity_graph",
+    "paired_wide_cut_updates",
+    "nccl_ll128"
   ],
   "torch_version": "2.10.0+cu128",
-  "merge": {
-    "decay": 0.04,
-    "coef": 0.75,
-    "every": 5,
-    "from_rows": 0.3
-  },
-  "row_prune": {
-    "rule": "kl",
-    "share": 0.015,
-    "rows": 192
-  },
   "identity": {
-    "updates": 175,
+    "updates": 315,
     "schedule_updates": 1831,
     "batch": 8,
     "sequence_len": 1024,
     "init": "prev8",
-    "init_rho": 0.9,
-    "init_content": 0.1,
     "value_output_pairing": {
       "layers": [
         0,
@@ -157,7 +136,7 @@
       "until": 195
     },
     "value_embed_partner_transfer": {
-      "gain": 1.0,
+      "gain": 0.5,
       "donor": "equal_window_partner",
       "until": 195
     },
@@ -170,24 +149,16 @@
     "lr_value_embeds": 1.8,
     "lr_lambdas": 0.006,
     "anvil_lr": 0.04,
-    "anvil_wd": 2.25
+    "anvil_wd": 2.25,
+    "rate_decay": {
+      "last_updates": 150,
+      "final": 0.3
+    }
   },
   "cut_anvil_decay": {
     "early_multiplier": 1.0,
     "late_multiplier": 0.0,
-    "late_after_updates": 286,
-    "horizon": 1083
-  },
-  "cut_stages": [
-    {
-      "from_update": 1,
-      "rows_per_update": 8,
-      "rate_scale": 1.0
-    },
-    {
-      "from_update": 543,
-      "rows_per_update": 16,
-      "rate_scale": 1.42
-    }
-  ]
+    "late_after_updates": 398,
+    "horizon": 1508
+  }
 }
