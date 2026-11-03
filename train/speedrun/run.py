@@ -4,8 +4,8 @@ Builds on qlabs-eng/noise#52 (itself on #51 and #44); the kernels it calls live 
 visit_gluon*.py, query_*.py, moment_kernels.py, key_gluon.py, value_gluon.py, id_kernels.py, gate_response.py,
 window_topk.py, project_values.py).
 
-1. Identity phase: 355 updates of 8 rows of #44's 1831-update plan, with #29's identity-path credit (full-cycle readout
-   credit, finite MLP responses and #29's attention moments). These 355 updates lie inside the plan's 368-update ANVIL
+1. Identity phase: 315 updates of 8 rows of #44's 1831-update plan, with #29's identity-path credit (full-cycle readout
+   credit, finite MLP responses and #29's attention moments). These 315 updates lie inside the plan's 368-update ANVIL
    momentum ramp; over the last 150 of them the Adam and ANVIL rates fall linearly to 0.3x (#52: handed off at full
    rate). ANVIL updates the matrices and Adam the rest. Block 1's c_q and c_k start with a planted previous-token
    query / key pair per head, its RoPE-frequency amplitudes decaying as 0.9^(i/2) (#52: 0.8^(i/2)). Listed under
@@ -14,7 +14,7 @@ window_topk.py, project_values.py).
    fixed energy, the VE gates' head-mean credit is pooled over the four VE layers, and each VE layer's centered Adam
    motion is joined by its partner layer's (1-5, 3-7). Those mechanisms are exact no-ops after update 195, so a
    second captured graph without them runs the remaining updates.
-2. Cut phase: 808 updates of the remaining rows: 148 of 8 rows, then 660 of 16 (#52: 1468 of 8), the 16-row updates
+2. Cut phase: 830 updates of the remaining rows: 152 of 8 rows, then 678 of 16 (#52: 1468 of 8), the 16-row updates
    at 1.3x both optimizers' rates. A 16-row update gives each GPU two rows, estimated together by one replay of a
    two-row estimate graph (the second row drawing its frames and signs from a partner Cut's generators). Each
    8-row step takes one row from each of 8 difficulty strata: rows ranked by the mean add-one-smoothed unigram
@@ -30,7 +30,7 @@ window_topk.py, project_values.py).
      keys per moved query, shifted by the tail centroid); its moved queries are computed from the root's 64-wide
      routed change against each token's Wo[routes] @ W_q^T. Each root's identity-path prediction (the readout credit
      times the residual scalars above it) is subtracted from the replay and added back to that root's credit. New:
-     from 10% to 70% of the Cut updates, block 4's root is replayed on every second update only, its measured
+     from 10% to 65% of the Cut updates, block 4's root is replayed on every second update only, its measured
      deviation from the prediction counted twice there (the other updates take the prediction alone). Block 7
      takes the readout credit, the other blocks the next block's credit times its residual scalar;
    - mixing scalars: each block's mid credit contracted with the scalar's two inputs, a linear step, plus #44's path
@@ -46,9 +46,10 @@ window_topk.py, project_values.py).
    reduce-scatter and one all-gather move each shard unit, each unit's polar and state update a CUDA graph; the
    other gradients are all-reduced in bf16; NCCL runs the LL128 protocol (set in this process before NCCL starts).
 3. One weight average (decay 0.02, every 5 updates over the last 70% of the Cut rows) is merged part by part inside
-   the run: each part's coefficient a in w + a (avg - w) from a parabola through three trial values on 24 identity
-   rows per rank (the parts split over the ranks), the joint move shrunk by the best of three factors on the 64
-   held-out rows (#52: a race over 4 keys at 0.75 or 1.0, decays 0.03 and 0.02).
+   the run: each part's coefficient a in w + a (avg - w) from a parabola through three trial values on 24 of the 64
+   held-out rows per rank (a window starting at row 8 * rank; the parts split over the ranks), the joint move shrunk
+   by the best of three factors on all 64 held-out rows (#52: a race over 4 keys at 0.75 or 1.0, decays 0.03 and
+   0.02). The merge reads only held-out rows: no row it reads feeds an update.
 
 config.json lists the changes against #44 (qlabs-eng/noise@3343973b) under "additions".
 
@@ -128,7 +129,7 @@ def end_training() -> None:
 
 
 SEED = 0
-IDENTITY_UPDATES, IDENTITY_SCHEDULE = 355, 1831  # hand off to Cut after 355 of 1831 planned identity updates
+IDENTITY_UPDATES, IDENTITY_SCHEDULE = 315, 1831  # hand off to Cut after 315 of 1831 planned identity updates
 EPS = torch.finfo(torch.float32).eps
 HADAMARDS = {}
 torch._dynamo.config.cache_size_limit = 64
@@ -2601,7 +2602,7 @@ def nccl_options():
     return options
 AMORTIZED_ROOTS = (4,)  # these chain roots replayed on every ROOT_EVERY-th update only (their groups must not hold others)
 ROOT_EVERY = 2  # AMORTIZED_ROOTS: the updates per measurement; a measuring update counts its deviation ROOT_EVERY times
-ROOT_FROM, ROOT_UNTIL = 0.1, 0.7  # AMORTIZED_ROOTS: the fractions of the Cut updates amortized (else measured)
+ROOT_FROM, ROOT_UNTIL = 0.1, 0.65  # AMORTIZED_ROOTS: the fractions of the Cut updates amortized (else measured)
 PREFETCH_PRIORITY = -1  # the gate-row prefetch and staging streams' priority (high: their kernels take free SMs first)
 
 
@@ -3059,7 +3060,7 @@ def prepare_resident_merge_score(model, settings, rank, world):
 # shares the vertices (clipped to QUAD_RANGE), and the joint move C0 -> vertices is shrunk by the best of QUAD_SHRINKS
 # on the 64 held-out rows.
 QUAD_DECAY, QUAD_C0, QUAD_DELTA, QUAD_RANGE = 0.02, 0.75, 0.5, (-0.25, 1.25)
-QUAD_ROWS, QUAD_SHRINKS = 24, (0.25, 0.5, 0.75)
+QUAD_ROWS, QUAD_SHRINKS = 24, (0.25, 0.5, 0.75)  # pick rows per rank: the held-out rows from rank * 8 on (wrapping)
 CUT_RESERVE_GB = 8  # a block this large allocated and freed before the timer: the timed allocations reuse the cache
 quad_reserve = []  # the warm-up's outputs, held until the merge so their memory stays in the allocator's cache
 
@@ -4161,7 +4162,7 @@ def train_stages(args, settings, device, rank, world):
                     train_rows=train_count + IDENTITY_UPDATES * BATCH,
                     upstream='qlabs-eng/noise@3343973b6f1af119effcdea2622f1fe672c51b1e',
                     additions=[
-                        'identity_handoff_at_355', 'identity_init_and_early_update_shaping', 'identity_rate_decay',
+                        'identity_handoff_at_315', 'identity_init_and_early_update_shaping', 'identity_rate_decay',
                         'difficulty_balanced_row_order', 'single_chain_roots_4_6', 'amortized_block4_root',
                         'reduced_forward_replay', 'diagonal_readout_moments', 'x0_skip_embedding_credit',
                         'fused_forward_kernels', 'late_zero_anvil_decay', 'in_run_part_merge',
@@ -4244,11 +4245,9 @@ def train_stages(args, settings, device, rank, world):
     all_rows = load_rows(args.data_dir / 'train.pt', TRAIN_ROWS)
     cut_rows = all_rows.index_select(0, train_indices)
     holdout_rows = all_rows.index_select(0, holdout_indices)
-    # the in-run merge's pick rows: this rank's share of the identity rows by a seeded permutation, copied to the GPU
-    # in the merge
-    shuffle = torch.randperm(len(identity_indices), generator=torch.Generator().manual_seed(SEED + 3))
-    picks = identity_indices[shuffle]
-    quad_rows = all_rows.index_select(0, picks[rank * QUAD_ROWS:(rank + 1) * QUAD_ROWS])
+    # the in-run merge's pick rows: QUAD_ROWS held-out rows from row 8 * rank on, wrapping (no row the merge reads feeds
+    # an update)
+    quad_rows = holdout_rows.roll(-rank * (HOLDOUT // world), 0)[:QUAD_ROWS]
     identity.bind_rows(all_rows.numpy())
     del all_rows
     staged_rows = torch.empty((train_count, cut_rows.shape[1]), dtype=cut_rows.dtype, pin_memory=True)
@@ -4276,7 +4275,8 @@ def train_stages(args, settings, device, rank, world):
             usage = dict(identity_rows=len(identity_indices), cut_rows=train_count, merge_rows=len(holdout_indices),
                          unused_rows=len(unused), unused_sha256=digest(unused), disjoint=True,
                          identity_sha256=digest(identity_indices), cut_sha256=digest(used),
-                         merge_sha256=digest(holdout_indices))
+                         merge_sha256=digest(holdout_indices),
+                         merge_pick_rows=f'{QUAD_ROWS} of merge_rows per rank, from row 8 * rank on (wrapping)')
             (args.output / 'row_usage.json').write_text(json.dumps(usage, indent=2) + '\n')
         return rows
 
