@@ -25,7 +25,7 @@ import triton
 import triton.language as tl
 from triton.language.extra import libdevice
 
-PREC = 'tf32'  # run.py's KEY_DOT_PRECISION
+PREC = 'tf32'  # the key / value credit kernels' logits and scores
 # measured (bench.py, one H100, CUDA graph replay)
 IMPLICIT_CONFIG = dict(BM=64, BN=64, num_warps=4, num_stages=2)
 MOMENT_CONFIG = dict(PAIRS=16, BLOCK_T=32, BLOCK_S=64, num_warps=4, num_stages=3)
@@ -179,18 +179,6 @@ def _implicit_key_context(q: torch.Tensor, k: torch.Tensor, values: torch.Tensor
         _implicit_key_statistics[(t // c['BM'], h)](q, k, values, hub, lse, center, T=t, Window=window, BM=c['BM'],
             BN=c['BN'], PREC=PREC, num_warps=c['num_warps'], num_stages=c['num_stages'])
     return lse, center
-
-
-@torch.library.custom_op('moment_kernels::implicit_key_context', mutates_args=())
-def implicit_key_context(q: torch.Tensor, k: torch.Tensor, values: torch.Tensor, hub: torch.Tensor,
-                         window: int) -> tuple[torch.Tensor, torch.Tensor]:
-    return _implicit_key_context(q, k, values, hub, window)
-
-
-@implicit_key_context.register_fake
-def _(q, k, values, hub, window):
-    h, t, _ = q.shape
-    return q.new_empty((h, t), dtype=torch.float32), q.new_empty((h, t), dtype=torch.float32)
 
 
 @torch.library.custom_op('moment_kernels::implicit_key_context_edges', mutates_args=())
@@ -360,25 +348,6 @@ def _(q, k, v, hub, raw, sq, side, cos, sin, lse, hub_out, steps, out, repeat, w
     return None
 
 
-@torch.library.custom_op('moment_kernels::moment_query_scores_by_token', mutates_args=())
-def moment_query_scores_by_token(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, hub: torch.Tensor,
-                                 raw: torch.Tensor, sq: torch.Tensor, side: torch.Tensor, cos: torch.Tensor,
-                                 sin: torch.Tensor, lse: torch.Tensor, hub_out: torch.Tensor, steps: torch.Tensor,
-                                 heads: int, window: int | None = None) -> torch.Tensor:
-    """moment_query_scores' credits as (layers, T, heads * D) fp32 (the rows are heads of rows // heads layers):
-    out[j] is layer j's query credit as the reference's out[0, rows].float().transpose(0, 1).reshape(T, -1)."""
-    rows, t, d = q.shape
-    out = torch.empty((rows // heads, t, heads * d), device=q.device)
-    _moment_query_scores(q, k, v, hub, raw, sq, side, cos, sin, lse, hub_out, steps, out, d // 16, window, heads)
-    return out
-
-
-@moment_query_scores_by_token.register_fake
-def _(q, k, v, hub, raw, sq, side, cos, sin, lse, hub_out, steps, heads, window=None):
-    rows, t, d = q.shape
-    return q.new_empty((rows // heads, t, heads * d), dtype=torch.float32)
-
-
 @torch.library.custom_op('moment_kernels::moment_query_scores_into', mutates_args=('out',))
 def moment_query_scores_into(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, hub: torch.Tensor, raw: torch.Tensor,
                              sq: torch.Tensor, side: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
@@ -402,7 +371,7 @@ def _(q, k, v, hub, raw, sq, side, cos, sin, lse, hub_out, steps, out, window=No
 def _moment_keys_kernel(q_ptr, k_ptr, v_ptr, hub_ptr, raw_ptr, sq_ptr, side_ptr, cos_ptr, sin_ptr, lse_ptr, hubout_ptr,
     steps_ptr, out_ptr, value_ptr, BH, T, scale, RAW_BLK, RAW_GPU, RAW_STRIDE, M, OUT_BLK, W_STRIDE,
     D: tl.constexpr, BLOCK_T: tl.constexpr, BLOCK_S: tl.constexpr):
-    """run.py's _moment_keys_kernel (repeat = 2) with both of a token tile's programs in one: the reference's two
+    """The reference key-moment kernel (repeat = 2) with both of a token tile's programs in one: the reference's two
     programs formed the same moment sums (pairs i % 32) and differed only in the output coordinates (d = pair,
     pair + 32) and the 32 hub columns of the value sum, so the sums are formed once and the value sum over all 64."""
     J: tl.constexpr = D // 2
@@ -484,7 +453,7 @@ def moment_key_scores(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, hub: to
                       sq: torch.Tensor, side: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, lse: torch.Tensor,
                       hub_out: torch.Tensor, steps: torch.Tensor, out: torch.Tensor, values: torch.Tensor,
                       repeat: int) -> None:
-    """Drop-in for run.py's moment_key_scores (the identity phase's key credits and value sums)."""
+    """The identity phase's key credits and value sums (a drop-in for the reference moment_key_scores)."""
     _moment_key_scores(q, k, v, hub, raw, sq, side, cos, sin, lse, hub_out, steps, out, values, repeat)
 
 
@@ -623,38 +592,6 @@ def _(qp, kp, k_raw, lse, values, hub, center, cos, sin, window, sigma):
     return torch.empty_like(k_raw)
 
 
-@torch.library.custom_op('moment_kernels::key_and_raw_value_credits', mutates_args=())
-def key_and_raw_value_credits(qp: torch.Tensor, kp: torch.Tensor, k_raw: torch.Tensor, lse: torch.Tensor,
-                              values: torch.Tensor, hub: torch.Tensor, center: torch.Tensor, cos: torch.Tensor,
-                              sin: torch.Tensor, window: int, sigma: float) -> tuple[torch.Tensor, torch.Tensor]:
-    """key_credits and the raw value credit (value_credits' first output) in one pass."""
-    return _key_scan(qp, kp, k_raw, lse, values, hub, center, cos, sin, window, sigma, True)
-
-
-@key_and_raw_value_credits.register_fake
-def _(qp, kp, k_raw, lse, values, hub, center, cos, sin, window, sigma):
-    return torch.empty_like(k_raw), torch.empty_like(hub)
-
-
-def _by_token_shape(x, heads):
-    rows, t, d = x.shape
-    return (rows // heads, t, heads * d)
-
-
-@torch.library.custom_op('moment_kernels::key_credits_by_token', mutates_args=())
-def key_credits_by_token(qp: torch.Tensor, kp: torch.Tensor, k_raw: torch.Tensor, lse: torch.Tensor,
-                         values: torch.Tensor, hub: torch.Tensor, center: torch.Tensor, cos: torch.Tensor,
-                         sin: torch.Tensor, window: int, sigma: float, heads: int) -> torch.Tensor:
-    """key_credits as (layers, T, heads * D) (the rows are heads of rows // heads layers): out[j] is layer j's key
-    credit as key[rows of j].transpose(0, 1).reshape(T, -1)."""
-    return _key_scan(qp, kp, k_raw, lse, values, hub, center, cos, sin, window, sigma, False, heads)[0]
-
-
-@key_credits_by_token.register_fake
-def _(qp, kp, k_raw, lse, values, hub, center, cos, sin, window, sigma, heads):
-    return k_raw.new_empty(_by_token_shape(k_raw, heads))
-
-
 @torch.library.custom_op('moment_kernels::key_credits_into', mutates_args=('out',))
 def key_credits_into(qp: torch.Tensor, kp: torch.Tensor, k_raw: torch.Tensor, lse: torch.Tensor, values: torch.Tensor,
                      hub: torch.Tensor, center: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, window: int,
@@ -668,21 +605,6 @@ def key_credits_into(qp: torch.Tensor, kp: torch.Tensor, k_raw: torch.Tensor, ls
 @key_credits_into.register_fake
 def _(qp, kp, k_raw, lse, values, hub, center, cos, sin, window, sigma, out, layers=None):
     return None
-
-
-@torch.library.custom_op('moment_kernels::key_and_raw_value_credits_by_token', mutates_args=())
-def key_and_raw_value_credits_by_token(qp: torch.Tensor, kp: torch.Tensor, k_raw: torch.Tensor, lse: torch.Tensor,
-                                       values: torch.Tensor, hub: torch.Tensor, center: torch.Tensor,
-                                       cos: torch.Tensor, sin: torch.Tensor, window: int, sigma: float,
-                                       heads: int) -> tuple[torch.Tensor, torch.Tensor]:
-    """key_and_raw_value_credits, both as (layers, T, heads * D)."""
-    return _key_scan(qp, kp, k_raw, lse, values, hub, center, cos, sin, window, sigma, True, heads)
-
-
-@key_and_raw_value_credits_by_token.register_fake
-def _(qp, kp, k_raw, lse, values, hub, center, cos, sin, window, sigma, heads):
-    shape = _by_token_shape(k_raw, heads)
-    return k_raw.new_empty(shape), k_raw.new_empty(shape)
 
 
 # --- value credits -------------------------------------------------------------------------------------------------
@@ -717,8 +639,8 @@ def _value_credit_kernel(Q, K, LSE, Hub, Out, T: tl.constexpr, Window: tl.conste
     tl.store(Out + out_start + target[:, None] * OUT_TOKEN + channels[None, :], acc)
 
 
-KEY_IMPL = None  # a replacement for _key_scan's kernel without values (run.py's KEY_GLUON: key_gluon.key_scan_gluon)
-VALUE_IMPL = None  # a replacement for _value_pass's kernel (run.py's VALUE_GLUON: value_gluon.value_pass_gluon)
+KEY_IMPL = None  # a replacement for _key_scan's kernel without values (run.py sets key_gluon.key_scan_gluon)
+VALUE_IMPL = None  # a replacement for _value_pass's kernel (run.py sets value_gluon.value_pass_gluon)
 
 
 def _value_pass(q, k, lse, source, window, in_heads=1, out_heads=1, out=None, layers=None):
@@ -763,6 +685,11 @@ def _(q, k, lse, corrected, window):
     return torch.empty_like(corrected)
 
 
+def _by_token_shape(x, heads):
+    rows, t, d = x.shape
+    return (rows // heads, t, heads * d)
+
+
 @torch.library.custom_op('moment_kernels::raw_value_credits_by_token', mutates_args=())
 def raw_value_credits_by_token(q: torch.Tensor, k: torch.Tensor, lse: torch.Tensor, hub: torch.Tensor, window: int,
                                heads: int) -> torch.Tensor:
@@ -774,20 +701,6 @@ def raw_value_credits_by_token(q: torch.Tensor, k: torch.Tensor, lse: torch.Tens
 @raw_value_credits_by_token.register_fake
 def _(q, k, lse, hub, window, heads):
     return hub.new_empty(_by_token_shape(hub, heads))
-
-
-@torch.library.custom_op('moment_kernels::terminal_value_credits_by_token', mutates_args=())
-def terminal_value_credits_by_token(q: torch.Tensor, k: torch.Tensor, lse: torch.Tensor, corrected: torch.Tensor,
-                                    window: int) -> torch.Tensor:
-    """terminal_value_credits with corrected and the output by token, (layers, T, heads * 64) contiguous: corrected[j]
-    is layer j's (chain + extra) @ c_proj^T as the matmul writes it."""
-    heads = corrected.shape[-1] // q.shape[-1]
-    return _value_pass(q, k, lse, corrected.contiguous(), window, heads, heads)
-
-
-@terminal_value_credits_by_token.register_fake
-def _(q, k, lse, corrected, window):
-    return torch.empty_like(corrected)
 
 
 @torch.library.custom_op('moment_kernels::terminal_value_credits_into', mutates_args=('out',))
@@ -802,11 +715,3 @@ def terminal_value_credits_into(q: torch.Tensor, k: torch.Tensor, lse: torch.Ten
 @terminal_value_credits_into.register_fake
 def _(q, k, lse, corrected, window, out, layers=None):
     return None
-
-
-def value_credits(context, corrected, window):
-    """Drop-in for run.py's value_credits: (raw, terminal) for one layer."""
-    q, k, raw, cos, sin, lse, (v, hub, center) = context
-    paired = torch.cat((hub.contiguous(), corrected.contiguous()), dim=-1)
-    out = _value_pass(q.contiguous(), k.contiguous(), lse.contiguous(), paired, window)
-    return out[..., :64].contiguous(), out[..., 64:].contiguous()

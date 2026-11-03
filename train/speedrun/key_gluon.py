@@ -232,7 +232,7 @@ def key_scan_gluon(qp, kp, k_raw, lse, values, hub, center, cos, sin, window, si
     g2 = torch.empty_like(f2)
     xy = torch.empty((h * t, 32), device=qp.device, dtype=torch.bfloat16)
     _features_kernel[(h * t // 64,)](q2, f2, g2, xy, BLOCK=64, num_warps=4)
-    qk16 = kp.dtype == torch.bfloat16  # (KEY_QK16: the query moments' bf16 q / k / values / hub)
+    qk16 = kp.dtype == torch.bfloat16  # (the query moments' bf16 q / k / values / hub)
     qk_gl = gl.bfloat16 if qk16 else gl.float32
     f32k = gl.NVMMASharedLayout.get_default_for([bt, 32], qk_gl)
     f32s = gl.NVMMASharedLayout.get_default_for([bs, 32], qk_gl)

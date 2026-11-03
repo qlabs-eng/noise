@@ -1,4 +1,4 @@
-"""stacked_gate_input_responses' elementwise core as one Triton kernel (GATE_RESPONSE_KERNEL).
+"""stacked_gate_input_responses' elementwise core as one Triton kernel.
 
 response[l, t, r] = sum_h (sigmoid(zp) - sigmoid(zm)) kappa[l, t, h] / steps[l, t] with
 zp / zm = (base[l, t, h] +- steps[l, t] projected[l, r, h]) * rsqrt(square[l, t] +- 2 steps cross[l, t, r]

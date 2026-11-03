@@ -5,80 +5,8 @@ import torch
 import triton
 import triton.language as tl
 
-# sweep (n = 2048 tokens, 8 heads, 16 keys, 512 columns): TB 4 / BO 256 / 8 warps 0.130 ms (one program per token and
-# head: 0.220; TB 8 / BO 128 0.150; TB 2 / BO 512 0.172; centring fused in: 0.273 and not bitwise)
-CONFIG = dict(TB=4, BO=256, num_warps=8, num_stages=2)
 
-
-@triton.jit
-def _project_values_blocked_kernel(C, W, Out, T: tl.constexpr, H: tl.constexpr, K: tl.constexpr, D: tl.constexpr,
-                                   O: tl.constexpr, TB: tl.constexpr, BO: tl.constexpr):
-    h, tb, ob = tl.program_id(0), tl.program_id(1), tl.program_id(2)
-    rows = tl.arange(0, TB * K)  # (token in block, key)
-    dd, oo = tl.arange(0, D), ob * BO + tl.arange(0, BO)
-    c = tl.load(C + ((h * T + tb * TB) * K + rows[:, None]) * D + dd[None, :])
-    w = tl.load(W + (h * D + dd[:, None]) * O + oo[None, :])
-    out = tl.dot(c, w)
-    t = tb * TB + rows // K
-    tl.store(Out + ((t[:, None] * H + h) * K + rows[:, None] % K) * O + oo[None, :], out.to(tl.bfloat16))
-
-
-def project_values(centered, w_proj_t):
-    """centered (H, T, K, D) bf16, w_proj_t (H * D, O) -> (T, H, K, O) bf16."""
-    heads, tokens, count, width = centered.shape
-    o = w_proj_t.shape[1]
-    cfg = dict(CONFIG)
-    tb, bo = cfg.pop('TB'), cfg.pop('BO')
-    assert tokens % tb == 0 and o % bo == 0
-    out = torch.empty((tokens, heads, count, o), device=centered.device, dtype=centered.dtype)
-    _project_values_blocked_kernel[(heads, tokens // tb, o // bo)](centered.contiguous(),
-      w_proj_t.to(centered.dtype).contiguous(), out, T=tokens, H=heads, K=count, D=width, O=o, TB=tb, BO=bo, **cfg)
-    return out
-
-
-# GATHERED_VALUES' inputs (n = 2048 keys and tokens, 8 heads, 16 keys, 512 columns); swept in visit-kernel/r20
-GATHERED_CONFIG = dict(TB=128, BO=64, num_warps=4, num_stages=2)
-
-
-@triton.jit
-def _gathered_tables_kernel(V, Origin, W, Idx, Table, Corr, Rows, T: tl.constexpr, H: tl.constexpr, K: tl.constexpr,
-                            D: tl.constexpr, O: tl.constexpr, TB: tl.constexpr, BO: tl.constexpr):
-    h, tb, ob = tl.program_id(0), tl.program_id(1), tl.program_id(2)
-    tt, dd, oo = tb * TB + tl.arange(0, TB), tl.arange(0, D), ob * BO + tl.arange(0, BO)
-    w = tl.load(W + (h * D + dd[:, None]) * O + oo[None, :])
-    v = tl.load(V + (h * T + tt[:, None]) * D + dd[None, :])
-    tl.store(Table + (h * T + tt[:, None]) * O + oo[None, :], tl.dot(v, w.to(tl.bfloat16)).to(tl.bfloat16))
-    neg = -tl.dot(tl.load(Origin + (h * T + tt[:, None]) * D + dd[None, :]), w, input_precision="tf32x3")
-    hi = neg.to(tl.bfloat16)
-    corr = Corr + (tt[:, None] * (2 * H) + h) * O + oo[None, :]
-    tl.store(corr, hi)
-    tl.store(corr + H * O, (neg - hi.to(tl.float32)).to(tl.bfloat16))
-    if ob == 0:
-        kk = tl.arange(0, K)
-        idx = tl.load(Idx + (h * T + tt[:, None]) * K + kk[None, :])
-        tl.store(Rows + tt[:, None] * (H * K) + h * K + kk[None, :], (idx + h * T).to(tl.int32))
-
-
-def gathered_tables(values, origin, indices, w_proj_t):
-    """values (H, T, D) bf16, origin (H, T, D) fp32 (the centring's origin: the attention output), indices (H, T, K),
-    w_proj_t (H * D, O) fp32 -> table bf16(values @ W_h) (H * T, O), correction -(origin @ W_h) as bf16 hi / lo
-    (T, 2 H, O; tf32x3 dot), rows h * T + indices (T, H * K) int32: project_values' rows as table[rows] + hi + lo."""
-    heads, tokens, width = values.shape
-    count, o = indices.shape[-1], w_proj_t.shape[1]
-    cfg = dict(GATHERED_CONFIG)
-    tb, bo = cfg.pop('TB'), cfg.pop('BO')
-    assert tokens % tb == 0 and o % bo == 0 and indices.shape[:2] == (heads, tokens)
-    dev = values.device
-    table = torch.empty((heads * tokens, o), device=dev, dtype=torch.bfloat16)
-    corr = torch.empty((tokens, 2 * heads, o), device=dev, dtype=torch.bfloat16)
-    rows = torch.empty((tokens, heads * count), device=dev, dtype=torch.int32)
-    _gathered_tables_kernel[(heads, tokens // tb, o // bo)](values.contiguous(), origin.float().contiguous(),
-      w_proj_t.float().contiguous(), indices.contiguous(), table, corr, rows, T=tokens, H=heads, K=count, D=width, O=o,
-      TB=tb, BO=bo, **cfg)
-    return table, corr, rows
-
-
-# FUSED_KEY_TABLES (n = 2048, 8 heads, 16 keys, 512 columns; visit-kernel/r20 bench_keys.py): one program per (head,
+# gathered_key_tables (n = 2048, 8 heads, 16 keys, 512 columns; visit-kernel/r20 bench_keys.py): one program per (head,
 # 32-token block) looping over 128-column blocks: 0.046 ms vs 0.116 for strong_key_shifted (compiled) + gathered_tables
 # (writes 81 MB: fill floor 0.028). Grid over column blocks too: 0.067; tf32x3 correction: 0.053.
 FUSED_KEYS_CONFIG = dict(TB=32, BO=128, TS=16, num_warps=4, STAGES=3)
