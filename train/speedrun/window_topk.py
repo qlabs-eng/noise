@@ -36,21 +36,8 @@ def _bitonic_stage(keys, vals, valid, lane, SIZE: tl.constexpr, STRIDE: tl.const
 
 
 @triton.jit
-def _window_topk_torch_kernel(Scores, Tops, Indices, N: tl.constexpr, K: tl.constexpr, LOG_N: tl.constexpr):
-    """torch.topk(scores, K) of bf16 rows bit for bit, order included: the selection by K repeated maxima of the packed
-    (value, N - 1 - index) as _window_topk16_kernel, then the selected in torch's gather order (above the K-th value by
-    index, then its ties by index) through ATen's 32-slot bitonic sort."""
-    row = tl.program_id(0).to(tl.int64)
-    cols = tl.arange(0, N)
-    b = tl.load(Scores + row * N + cols).to(tl.int16, bitcast=True).to(tl.int32)
-    ordered = tl.where(b < 0, b ^ 0x7FFF, b)
-    packed = (ordered << LOG_N) | (N - 1 - cols)
-    lane = tl.arange(0, 32)
-    top = tl.full([32], -2147483648, tl.int32)
-    for j in tl.static_range(K):
-        m = tl.max(packed, 0)
-        top = tl.where(lane == j, m, top)
-        packed = tl.where(packed == m, -2147483648, packed)
+def _store_in_torch_order(top, lane, Tops, Indices, row, N: tl.constexpr, K: tl.constexpr, LOG_N: tl.constexpr):
+    """The K selected packed keys (lanes 0..K-1, descending) stored as torch.topk orders them (see the module doc)."""
     o = top >> LOG_N
     col = N - 1 - (top & (N - 1))
     kth = tl.sum(tl.where(lane == K - 1, o, 0), 0)
@@ -81,6 +68,80 @@ def _window_topk_torch_kernel(Scores, Tops, Indices, N: tl.constexpr, K: tl.cons
     out = lane < K
     tl.store(Indices + row * K + lane, vals.to(tl.int64), out)
     tl.store(Tops + row * K + lane, keys.to(tl.bfloat16), out)
+
+
+@triton.jit
+def _window_topk_torch_kernel(Scores, Tops, Indices, N: tl.constexpr, K: tl.constexpr, LOG_N: tl.constexpr):
+    """torch.topk(scores, K) of bf16 rows bit for bit, order included: the selection by K repeated maxima of the packed
+    (value, N - 1 - index) as _window_topk16_kernel, then the selected in torch's gather order (above the K-th value by
+    index, then its ties by index) through ATen's 32-slot bitonic sort."""
+    row = tl.program_id(0).to(tl.int64)
+    cols = tl.arange(0, N)
+    b = tl.load(Scores + row * N + cols).to(tl.int16, bitcast=True).to(tl.int32)
+    ordered = tl.where(b < 0, b ^ 0x7FFF, b)
+    packed = (ordered << LOG_N) | (N - 1 - cols)
+    lane = tl.arange(0, 32)
+    top = tl.full([32], -2147483648, tl.int32)
+    for j in tl.static_range(K):
+        m = tl.max(packed, 0)
+        top = tl.where(lane == j, m, top)
+        packed = tl.where(packed == m, -2147483648, packed)
+    _store_in_torch_order(top, lane, Tops, Indices, row, N, K, LOG_N)
+
+
+@triton.jit
+def _window_topk_pruned_kernel(Scores, Tops, Indices, N: tl.constexpr, K: tl.constexpr, LOG_N: tl.constexpr,
+                               G: tl.constexpr):
+    """_window_topk_torch_kernel's selection over K groups only: the packed keys are distinct, so every top-K key lies in
+    one of the K groups (of G consecutive columns) with the largest maxima; those groups are loaded again and the K
+    repeated maxima taken over their K * G keys."""
+    row = tl.program_id(0).to(tl.int64)
+    NG: tl.constexpr = N // G
+    cols = tl.arange(0, NG)[:, None] * G + tl.arange(0, G)[None, :]
+    group_max = tl.max(_packed_keys(Scores, row, cols, N, LOG_N), 1)
+    slots = tl.arange(0, K)
+    groups = tl.zeros([K], tl.int32)
+    for j in tl.static_range(K):
+        m = tl.max(group_max, 0)
+        groups = tl.where(slots == j, (N - 1 - (m & (N - 1))) // G, groups)
+        group_max = tl.where(group_max == m, -2147483648, group_max)
+    left = _packed_keys(Scores, row, groups[:, None] * G + tl.arange(0, G)[None, :], N, LOG_N)
+    lane = tl.arange(0, 32)
+    top = tl.full([32], -2147483648, tl.int32)
+    for j in tl.static_range(K):
+        m = tl.max(tl.max(left, 1), 0)
+        top = tl.where(lane == j, m, top)
+        left = tl.where(left == m, -2147483648, left)
+    _store_in_torch_order(top, lane, Tops, Indices, row, N, K, LOG_N)
+
+
+@triton.jit
+def _packed_keys(Scores, row, cols, N: tl.constexpr, LOG_N: tl.constexpr):
+    """Scores[row, cols] (bf16) as distinct int32 keys: the value's bits in order (-0 below +0), then N - 1 - col."""
+    b = tl.load(Scores + row * N + cols).to(tl.int16, bitcast=True).to(tl.int32)
+    return (tl.where(b < 0, b ^ 0x7FFF, b) << LOG_N) | (N - 1 - cols)
+
+
+@torch.library.custom_op('visit_kernel::window_topk_pruned', mutates_args=())
+def window_topk_pruned(scores: torch.Tensor, count: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """window_topk (bitwise) by _window_topk_pruned_kernel (groups of N / (16 count))."""
+    n = scores.shape[-1]
+    if scores.dtype != torch.bfloat16 or n & (n - 1) or n > 4096 or count > 32 or count & (count - 1) or n < 16 * count:
+        return window_topk(scores, count)
+    rows = scores.numel() // n
+    g = n // (16 * count)
+    tops = torch.empty((*scores.shape[:-1], count), device=scores.device, dtype=scores.dtype)
+    indices = torch.empty((*scores.shape[:-1], count), device=scores.device, dtype=torch.int64)
+    _window_topk_pruned_kernel[(rows,)](scores.contiguous(), tops, indices, N=n, K=count,
+      LOG_N=n.bit_length() - 1, G=g, num_warps=1)
+    return tops, indices
+
+
+@window_topk_pruned.register_fake
+def _(scores, count):
+    shape = (*scores.shape[:-1], count)
+    return (torch.empty(shape, device=scores.device, dtype=scores.dtype),
+      torch.empty(shape, device=scores.device, dtype=torch.int64))
 
 
 @torch.library.custom_op('visit_kernel::window_topk', mutates_args=())

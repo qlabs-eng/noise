@@ -17,8 +17,11 @@ from triton.experimental.gluon.language.nvidia.hopper import (
     async_copy as cp, fence_async_shared, mbarrier, tma, warpgroup_mma, warpgroup_mma_wait)
 from triton.experimental.gluon.nvidia.hopper import TensorDescriptor
 
+from visit_chain import _bf16, _rbf16
+
 # NS: Wo ring slots, NST: output staging slots, CTAS: CTAs per SM (shared memory permitting)
-ROOT_CONFIGS = {128: dict(NS=2, NST=3, CTAS=3), 64: dict(NS=2, NST=3, CTAS=4, QPF=True, maxnreg=128)}
+ROOT_CONFIGS = {128: dict(NS=2, NST=3, CTAS=3), 64: dict(NS=2, NST=3, CTAS=4, QPF=True, maxnreg=128, PK=0)}
+# PK: packed fp32 -> bf16 conversions (visit_chain._bf16 / _rbf16: no scalar F2F round trips; roundings bitwise)
 _SMS = {}
 
 
@@ -39,17 +42,22 @@ def _frame_issue(frame_desc, fbar, stg, k, move0, c, pred, NBYTES: gl.constexpr,
 @gluon.jit
 def _root_chunk(out, c, it, step, scale, token, row0, move0, nxt_move0, nxt_tile, nxt_token, TILES, q0, q1, nx, NextX,
     out_desc, frame_desc, fbar, stg, ocols, KC: gl.constexpr, NST: gl.constexpr, BM: gl.constexpr, BK: gl.constexpr,
-    D: gl.constexpr, QSTATS: gl.constexpr, mma2: gl.constexpr, DELTA: gl.constexpr = True):
+    D: gl.constexpr, QSTATS: gl.constexpr, mma2: gl.constexpr, DELTA: gl.constexpr = True, PK: gl.constexpr = False):
     """Output chunk c's epilogue: + step * frame chunk (in staging slot k % NST), scale, back into the slot, out by TMA;
     the slot of chunk k - 1 refills with frame chunk k + NST - 1 once its store has left."""
     k = it * KC + c
     slot = k % NST
     mbarrier.wait(fbar.index(slot), (k // NST) & 1)
     old = step * stg.index(slot).load(mma2).to(gl.float32)  # frame entries are +-1: exact
-    value = (old + out.to(gl.bfloat16).to(gl.float32)).to(gl.bfloat16).to(gl.float32)
-    result = (value * scale).to(gl.bfloat16)
-    if QSTATS:  # nx: next_x's chunk c, loaded a chunk ahead; the next one goes in flight
+    if PK:
+        value = _rbf16(old + _rbf16(out))
+        stored = _rbf16(value * scale)
+        result = _bf16(stored)  # exact
+    else:
+        value = (old + out.to(gl.bfloat16).to(gl.float32)).to(gl.bfloat16).to(gl.float32)
+        result = (value * scale).to(gl.bfloat16)
         stored = result.to(gl.float32)
+    if QSTATS:  # nx: next_x's chunk c, loaded a chunk ahead; the next one goes in flight
         q0 += gl.sum(stored * nx[None, :], 1)
         q1 += gl.sum(stored * stored, 1)
         nx = gl.load(NextX + gl.where(c + 1 < KC, token, nxt_token) * D + ((c + 1) % KC) * BK + ocols)
@@ -70,7 +78,7 @@ def _root_chunk(out, c, it, step, scale, token, row0, move0, nxt_move0, nxt_tile
 def _root_kernel(out_desc, frame_desc, change_desc, Steps, Proj, Wo, Routes, Clean, Inv0, Inv, Scale, NextX, Stats, TILES,
     P: gl.constexpr, D: gl.constexpr, R: gl.constexpr, NS: gl.constexpr, NST: gl.constexpr, QSTATS: gl.constexpr,
     num_warps: gl.constexpr, OVL: gl.constexpr = False, QPF: gl.constexpr = False, CHANGE: gl.constexpr = False,
-    DELTA: gl.constexpr = True):
+    DELTA: gl.constexpr = True, PK: gl.constexpr = False):
     BM: gl.constexpr = 64
     BK: gl.constexpr = 64
     KC: gl.constexpr = D // BK
@@ -128,7 +136,10 @@ def _root_kernel(out_desc, frame_desc, change_desc, Steps, Proj, Wo, Routes, Cle
         step = gl.load(Steps + token)
         if not QPF:
             q = gl.load(Proj + gl.load(Routes + token * R + qcols).to(gl.int32)[None, :] * P + (move0 + qrows)[:, None])
-        moved = (q * step.to(gl.bfloat16).to(gl.float32)).to(gl.bfloat16).to(gl.float32)
+        if PK:
+            moved = _rbf16(q * step.to(gl.bfloat16).to(gl.float32))
+        else:
+            moved = (q * step.to(gl.bfloat16).to(gl.float32)).to(gl.bfloat16).to(gl.float32)
         inv = gl.load(Inv + row0 + qrows)
         inv0 = gl.load(Inv0 + token)
         h = gl.load(Clean + token * R + qcols).to(gl.float32)
@@ -138,7 +149,10 @@ def _root_kernel(out_desc, frame_desc, change_desc, Steps, Proj, Wo, Routes, Cle
         if CHANGE and not DELTA:
             tma.store_wait(0)  # the previous tile's change store has read csm (with DELTA: older than its waits)
         gl.thread_barrier()  # the previous tile's output wgmmas (waited) are done with csm in every warp
-        csm.store(((up - down) * (up + down)).to(gl.bfloat16))
+        if PK:
+            csm.store(_bf16((up - down) * (up + down)))
+        else:
+            csm.store(((up - down) * (up + down)).to(gl.bfloat16))
         fence_async_shared()
         gl.thread_barrier()
         if CHANGE:  # the change (BM x R bf16) out by TMA
@@ -169,7 +183,8 @@ def _root_kernel(out_desc, frame_desc, change_desc, Steps, Proj, Wo, Routes, Cle
                 else:
                     out = warpgroup_mma_wait(0, deps=[cur])
                 q0, q1, nx = _root_chunk(out, c, it, step, scale, token, row0, move0, nxt_move0, nxt_tile, nxt_token,
-                  TILES, q0, q1, nx, NextX, out_desc, frame_desc, fbar, stg, ocols, KC, NST, BM, BK, D, QSTATS, mma2, DELTA)
+                  TILES, q0, q1, nx, NextX, out_desc, frame_desc, fbar, stg, ocols, KC, NST, BM, BK, D, QSTATS, mma2, DELTA,
+                  PK)
         else:
             for c in range(KC):
                 cp.wait_group(NS - 2)
@@ -180,7 +195,8 @@ def _root_kernel(out_desc, frame_desc, change_desc, Steps, Proj, Wo, Routes, Cle
                 out = warpgroup_mma(csm, wsm.index((base + c) % NS), zero, use_acc=False, is_async=True)
                 out = warpgroup_mma_wait(0, deps=[out])
                 q0, q1, nx = _root_chunk(out, c, it, step, scale, token, row0, move0, nxt_move0, nxt_tile, nxt_token,
-                  TILES, q0, q1, nx, NextX, out_desc, frame_desc, fbar, stg, ocols, KC, NST, BM, BK, D, QSTATS, mma2, DELTA)
+                  TILES, q0, q1, nx, NextX, out_desc, frame_desc, fbar, stg, ocols, KC, NST, BM, BK, D, QSTATS, mma2, DELTA,
+                  PK)
         if QSTATS:
             stats_rows = Stats + (row0 + orows).to(gl.int64) * 2
             gl.store(stats_rows, q0)
@@ -232,3 +248,36 @@ def _(steps, basis, projection, wo, routes, clean, inv0, inv, scale, next_x, del
       torch.empty((n, p, 2, 1), device=wo.device, dtype=torch.float32))
 
 
+@torch.library.custom_op('visit_kernel::fused_root_visit_fast', mutates_args=())
+def fused_root_visit_fast(steps: torch.Tensor, basis: torch.Tensor, projection: torch.Tensor, wo: torch.Tensor,
+    routes: torch.Tensor, clean: torch.Tensor, inv0: torch.Tensor, inv: torch.Tensor, scale: torch.Tensor,
+    next_x: Optional[torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
+    """fused_root_visit: out (n, P, D) bf16 and, with next_x, the query-norm sums (n, P, 2, 1); basis is the signed
+    Hadamard frame, read as bf16 (exact: its entries are +-1)."""
+    n, p, d, r = steps.shape[0], basis.shape[0], wo.shape[1], routes.shape[1]
+    assert p % 64 == 0 and d % 64 == 0
+    cfg = dict(ROOT_CONFIGS[r])
+    ctas = cfg.pop('CTAS')
+    out = torch.empty((n, p, d), device=wo.device, dtype=torch.bfloat16)
+    stats = torch.empty((n, p, 2, 1), device=wo.device, dtype=torch.float32)
+    layout = gl.NVMMASharedLayout.get_default_for([64, 64], gl.bfloat16)
+    out_desc = TensorDescriptor.from_tensor(out.view(n * p, d), [64, 64], layout)
+    dev = wo.device.index
+    if dev not in _SMS:
+        _SMS[dev] = (132 if wo.device.type == 'cpu'
+          else torch.cuda.get_device_properties(wo.device).multi_processor_count)
+    tiles = n * (p // 64)
+    f32 = lambda z: z.float().contiguous()
+    frame_desc = TensorDescriptor.from_tensor(basis.to(torch.bfloat16).contiguous(), [64, 64], layout)
+    _root_kernel[(min(tiles, ctas * _SMS[dev]),)](out_desc, frame_desc, out_desc, f32(steps),
+      f32(projection), wo.contiguous(), routes.contiguous(), f32(clean), f32(inv0), f32(inv), scale,
+      f32(next_x) if next_x is not None else out, stats, tiles, p, d, r, QSTATS=next_x is not None, num_warps=4,
+      **cfg)
+    return out, stats
+
+
+@fused_root_visit_fast.register_fake
+def _(steps, basis, projection, wo, routes, clean, inv0, inv, scale, next_x):
+    n, p, d = steps.shape[0], basis.shape[0], wo.shape[1]
+    return (torch.empty((n, p, d), device=wo.device, dtype=torch.bfloat16),
+      torch.empty((n, p, 2, 1), device=wo.device, dtype=torch.float32))
