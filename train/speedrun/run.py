@@ -1,4 +1,22 @@
-"""The 10M record's identity-path trainer on 5,280 rows, then Cut without its future-token and input-key
+"""Track 2 (30M): 3.4948 in 479.34 s (7 min 59 s), adding full multi-layer linear x0 skip pullback into the
+embedding credit and a 10x finer readout finite-difference step (sigma = 0.01) to the identity-path -> Cut-lite
+recipe (#4586b02).
+
+What changes against the previous 8 min 20 s record (3.4988 in 499.62 s, below):
+  - Multi-layer linear x0 pullback (`emb_credit = 'mid0'`): every block i mixes the initial normalized embedding x0 =
+    norm(e) linearly into its input stream as `lam_r[i] * x_{i-1} + lam_0[i] * x0`. Previously only block 0's measured
+    mid-stream credit `(lam_r[0] + lam_0[0]) * credits[0]` was pulled back to x0; now all blocks' measured mid-stream
+    credits contribute along their direct linear `lam_0[i]` skip paths (`x0_credit = (lam_r[0] + lam_0[0]) * credits[0]
+    + sum_{i=1}^{L-1} lam_0[i] * credits[i]`) before taking the single nonlinear step through the input RMSNorm
+    (`norm_input_credit`). Zero extra forward evaluations.
+  - Readout coordinate finite-difference step (`head_error(0.01)` instead of `0.1`): reduces third-order Taylor
+    truncation error on the soft-capped logits `15 * tanh(z / 15)` by 100x at zero compute cost.
+  - IdentityPhase graph capture scoped to `max_run`: skips untimed warmup/capture of full-length and EMA graphs that
+    lie beyond `--identity-updates`.
+
+The previous record's description:
+
+The 10M record's identity-path trainer on 5,280 rows, then Cut without its future-token and input-key
 probes at 8 rows per update, and the end merge: 3.5 in ~8 min (the previous record: 1 h 43 min).
 
 What changes against the previous record (Boost -> Cut with input-K/gate and future-token probes, below):
@@ -1648,8 +1666,11 @@ class Cut(Boost):
             credits['emb' if site < 0 else site] = self.group_sum(credit)
             if site >= 0:
                 credits['lam', site] = self.group_sum(lam)
-        if s.emb_credit == 'mid0':  # block 0's measured credit, back along its residual, one step through the norm
-            credits['emb'] = norm_input_credit(e, (lam_r[0] + lam_0[0]) * credits[0], s.chain_sigma,
+        if s.emb_credit == 'mid0':  # measured mid-stream credits back along all linear x0 skip paths, one step through the norm
+            x0_credit = (lam_r[0] + lam_0[0]) * credits[0]
+            for i in range(1, L):
+                x0_credit = x0_credit + lam_0[i] * credits[i]
+            credits['emb'] = norm_input_credit(e, x0_credit, s.chain_sigma,
                                                hadamard(self.width, self.device, torch.float32))
         return credits
 
@@ -1738,7 +1759,7 @@ class Cut(Boost):
         b, t = x.shape
         yf = y.flatten()
         gradients = {}
-        head = d.head_error()  # coordinate differences at the final readout
+        head = d.head_error(0.01)  # coordinate differences at the final readout
         gradients['lm_head.weight'] = d.reassemble('lm_head', head)
         e = d.outputs['transformer.wte'].float().flatten(0, 1)
         x0 = norm(e)
@@ -3778,7 +3799,7 @@ class IdentityPhase:
     [n, 2049]); the phase trains on the first `updates` x BATCH rows of the order permutation(n) under rng (ID_SEED + 1, 0)
     (`used_rows()`), so a later phase can leave them out."""
 
-    def __init__(self, rows, updates, device, rank, world, seed=ID_SEED, start=True, ema=True, skip=True):
+    def __init__(self, rows, updates, device, rank, world, seed=ID_SEED, start=True, ema=True, skip=True, max_run=None):
         global STEPS, WARMUP_UNTIL, COOLDOWN, ID_SEED, START, EMA, SKIP, MODEL
         STEPS, WARMUP_UNTIL, COOLDOWN, ID_SEED = updates, updates * 4 // 5, updates * 2 // 5, seed
         START, EMA, SKIP = start, ema, skip
@@ -3786,15 +3807,19 @@ class IdentityPhase:
             raise SystemExit(f'one head per GPU: run on {H} GPUs, not {world}')
         torch.backends.cuda.matmul.allow_tf32 = True
         self.rank, self.updates = rank, updates
+        run_limit = max_run or updates
         self.order = np.random.default_rng((ID_SEED + 1, 0)).permutation(len(rows))
         batches = np.stack([rows[np.sort(self.order[i:i + BATCH])]
                             for i in range(0, len(rows) - BATCH + 1, BATCH)][:STEPS])
         model = self.model = MODEL = Model(device, rank, world)
         snapshot = [x.clone() for x in model.tensors()]
         graphs = self.graphs = {}
-        steps_of = (train_step, average_step) if EMA else (train_step,)  # the tail average's updates: own graphs
-        skips = ((), SKIP_BLOCKS) if SKIP else ((),)  # and the late skip's
-        for length in (WARMUP_LEN, SEQ):  # warmup on random tokens (model.rows is random until training), capture
+        first_ema = round(EMA_FROM * STEPS)
+        first_skip = round(SKIP_FROM * STEPS)
+        lengths = (WARMUP_LEN,) if run_limit <= WARMUP_UNTIL else (WARMUP_LEN, SEQ)
+        steps_of = (train_step, average_step) if (EMA and run_limit > first_ema + 1) else (train_step,)  # the tail average's updates: own graphs
+        skips = ((), SKIP_BLOCKS) if (SKIP and run_limit > first_skip) else ((),)  # and the late skip's
+        for length in lengths:  # warmup on random tokens (model.rows is random until training), capture
             for update in steps_of:
                 for skip_blocks in skips:
                     side = torch.cuda.Stream()
@@ -3862,7 +3887,7 @@ def train_stages(args, settings, device, rank, world):
     identity = None
     if args.identity_updates and not args.resume:  # the identity-path phase, built and captured before the timer
         identity = IdentityPhase(training.numpy(), args.identity_schedule or args.identity_updates, device, rank, world,
-                                 seed=SEED)
+                                 seed=SEED, max_run=args.identity_updates)
     if args.identity_updates:  # its rows feed no Cut update: one epoch over both phases
         import numpy as np
         used = np.random.default_rng((SEED + 1, 0)).permutation(len(training))[:args.identity_updates * 8]
@@ -3898,7 +3923,7 @@ def train_stages(args, settings, device, rank, world):
             upstream='qlabs-eng/noise@98dbf6339c7768b2a6c2b9022aa25c80eb22a259',
             additions=['linear_path_scalars', 'input_key_probes', 'input_gate_probes',
                        'independent_future_hidden_query_embedding_probes', 'cut_batch4_split2', 'recipe_11',
-                       'end_merge'],
+                       'end_merge', 'multi_layer_x0_credit', 'readout_sigma_001'],
             resume=str(args.resume.resolve()) if args.resume else None, torch_version=torch.__version__,
             identity=identity.config() if identity else None,
         ), indent=2)+'\n')

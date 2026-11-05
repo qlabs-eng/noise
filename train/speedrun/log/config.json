@@ -84,7 +84,9 @@
     "independent_future_hidden_query_embedding_probes",
     "cut_batch4_split2",
     "recipe_11",
-    "end_merge"
+    "end_merge",
+    "multi_layer_x0_credit",
+    "readout_sigma_001"
   ],
   "resume": null,
   "torch_version": "2.10.0+cu128",
