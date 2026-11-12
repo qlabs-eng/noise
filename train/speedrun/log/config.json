@@ -1,5 +1,5 @@
 {
-  "script": "/home/robert_sakana_ai/dust-repro/speedrun_jobs/fw30m/tsnap/1a47231/train/speedrun/run.py",
+  "script": "/workspace/run/train/speedrun/run.py",
   "world": 8,
   "seed": 0,
   "recipe": {
@@ -93,7 +93,9 @@
     "joint_qk_head_polar",
     "split_identity_graph",
     "paired_wide_cut_updates",
-    "nccl_ll128"
+    "nccl_ll128",
+    "bidirectional_chain_tail_lerp",
+    "soft_rms_cross_lanes"
   ],
   "torch_version": "2.10.0+cu128",
   "identity": {
