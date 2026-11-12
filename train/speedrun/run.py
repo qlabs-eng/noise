@@ -32,7 +32,9 @@ window_topk.py, project_values.py).
      times the residual scalars above it) is subtracted from the replay and added back to that root's credit. New:
      from 10% to 65% of the Cut updates, block 4's root is replayed on every second update only, its measured
      deviation from the prediction counted twice there (the other updates take the prediction alone). Block 7
-     takes the readout credit, the other blocks the next block's credit times its residual scalar;
+     takes the readout credit, the other blocks the next block's credit times its residual scalar, with block 5
+     (sandwiched between measured roots 4 and 6) linearly blending 20% of the upward inverse-scalar residual credit
+     from root 4;
    - mixing scalars: each block's mid credit contracted with the scalar's two inputs, a linear step, plus #44's path
      term (the value- and gate-path input credits contracted the same way);
    - the embedding's credit: every block's mid credit summed along its x0 skip, one finite step back through the
@@ -40,8 +42,8 @@ window_topk.py, project_values.py).
    - query and key credits from the degree-2 moment model of the softmax's response to a finite step of each raw
      coordinate through the norm and RoPE; #44's value and gate paths (exact linear value credit; one finite norm or
      gate step whose credit feeds only linear consumers).
-   The ANVIL step orthogonalizes each head's c_q and c_k rows together (one polar per head and block; #52: whole
-   matrices); its weight decay is zero after the first 275/1043 of the updates; warmdown 0.55 of the updates (#52:
+   The ANVIL step orthogonalizes each head's c_q and c_k rows together with soft cross-lane RMS equalization (one
+   polar per head and block; #52: whole matrices); its weight decay is zero after the first 275/1043 of the updates; warmdown 0.55 of the updates (#52:
    0.5). Each rank updates 1/8 of every ANVIL shape batch, its weights stored rank-major so that one bf16
    reduce-scatter and one all-gather move each shard unit, each unit's polar and state update a CUDA graph; the
    other gradients are all-reduced in bf16; NCCL runs the LL128 protocol (set in this process before NCCL starts).
@@ -1490,6 +1492,9 @@ def chain_tail(measured, g_top, lam_r, lam_0, x0, outs):
     credits[L - 1] = measured[L - 1] if measured[L - 1] is not None else g_top
     for i in reversed(range(L - 1)):
         credits[i] = measured[i] if measured[i] is not None else lam_r[i + 1] * credits[i + 1]
+    for i in range(1, L - 1):
+        if measured[i] is None and measured[i - 1] is not None and measured[i + 1] is not None:
+            credits[i] = credits[i].lerp(credits[i - 1] / lam_r[i].clamp_min(1e-6), 0.20)
     lams = [torch.stack([(credits[i] * (x0 if i == 0 else outs[i - 1])).sum(), (credits[i] * x0).sum()])
             for i in range(L)]
     x0_credit = lam_r[0] * credits[0] + sum(lam_0[i] * credits[i] for i in range(L))
@@ -2545,7 +2550,8 @@ def polar_batch(g, margin, heads: int = 1):
 
 def cross_lanes(gained, lanes: int):
     """Each lane of the axis the lane energy does not average over rescaled to equal RMS."""
-    return gained
+    rms = gained.square().mean(2 - lanes, keepdim=True).sqrt()
+    return gained * rms.lerp(rms.mean((1, 2), keepdim=True), 0.75).clamp_min(1e-10).rsqrt()
 
 
 @torch.compile(dynamic=False)
@@ -4172,6 +4178,7 @@ def train_stages(args, settings, device, rank, world):
                         'fused_gluon_chain_kernels', 'gluon_key_value_kernels', 'bf16_weight_credits',
                         'sharded_anvil_bf16_async_collectives', 'rank_major_anvil_graphs', 'joint_qk_head_polar',
                         'split_identity_graph', 'paired_wide_cut_updates', 'nccl_ll128',
+                        'bidirectional_chain_tail_lerp', 'soft_rms_cross_lanes',
                     ],
                     torch_version=torch.__version__,
                     identity=identity.config(),
