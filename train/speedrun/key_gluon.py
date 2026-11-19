@@ -1,12 +1,11 @@
-"""Gluon (Hopper) key credit scan: moment_kernels._key_scan (without the raw value credits) as an FA3-style kernel.
+"""Gluon (Hopper) key credit scan as an FA3-style kernel: each key direction's degree-2 moment response.
 
-CTA = 128 keys (two warpgroups) of one head; the window's receiver blocks (64 queries) stream through a 2-stage TMA
-ring: the queries and the hub (fp32, 32-column halves) and the queries' bf16 pair features (formed once per call by
-_features_kernel, the same bf16 operands the Triton kernel forms per block). Per block: logit = keys @ queries^T and
-score = values @ hub^T (tf32 wgmmas from shared memory), the weights w1 = a c, w2 = (a / 2 - a^2) c and w2 * logit
-(masked only on the window's edge blocks), then p2 += w1 @ f2, q2 += w2 @ g2, qxy += w2 @ xy, r2 += w2l @ f2 (bf16,
-A from registers). The epilogue forms each direction's response from its pair's sums (directions d and d + 32 share
-pair d) without gathers.
+CTA = BT keys of one head; the window's receiver blocks (BS queries) stream through a STAGES-stage TMA ring: the
+queries, the hub and the queries' pair features, all bf16 (the features formed once per call by _features_kernel).
+Per block: logit = keys @ queries^T and score = values @ hub^T (wgmmas from shared memory), the weights w1 = a c,
+w2 = (a / 2 - a^2) c and w2 * logit (masked only on the window's edge blocks), then p2 += w1 @ f2, q2 += w2 @ g2,
+qxy += w2 @ xy, r2 += w2l @ f2. The epilogue forms each direction's response from its pair's sums (directions d and
+d + 32 share pair d) without gathers. The same scan accumulates the raw value credits.
 """
 import torch
 import triton
@@ -17,7 +16,7 @@ from triton.experimental.gluon.language.nvidia.hopper import (
     mbarrier, tma, warpgroup_mma, warpgroup_mma_wait)
 from triton.experimental.gluon.nvidia.hopper import TensorDescriptor
 
-CONFIG = dict(BT=128, BS=64, STAGES=2, PF=0)  # PF: the receivers' lse / center rows by TMA with the ring (bitwise)
+CONFIG = dict(BT=64, BS=32, STAGES=2)
 LOG2E = gl.constexpr(1.4426950408889634)
 
 
@@ -37,17 +36,14 @@ def _features_kernel(Q, F2, G2, XY, BLOCK: tl.constexpr):
 
 @gluon.jit
 def _issue(q_desc, h_desc, f2_desc, g2_desc, xy_desc, bar, qsm, hsm, f2sm, g2sm, xysm, slot, row, pred,
-    BS: gl.constexpr, lse_desc=None, center_desc=None, lcsm=None, PF: gl.constexpr = False, QK16: gl.constexpr = False):
-    mbarrier.expect(bar.index(slot), 2 * BS * 64 * (2 if QK16 else 4) + 2 * BS * 64 * 2 + BS * 32 * 2 + (2 * BS * 4 if PF else 0),
+    BS: gl.constexpr, lse_desc=None, center_desc=None, lcsm=None):
+    mbarrier.expect(bar.index(slot), 2 * BS * 64 * 2 + 2 * BS * 64 * 2 + BS * 32 * 2 + 2 * BS * 4, pred=pred)
+    # rows of BS receivers' lse / center ((h T / BS, BS) views)
+    tma.async_copy_global_to_shared(lse_desc, [row // BS, 0], bar.index(slot), lcsm.index(2 * slot), pred=pred)
+    tma.async_copy_global_to_shared(center_desc, [row // BS, 0], bar.index(slot), lcsm.index(2 * slot + 1),
       pred=pred)
-    if PF:  # rows of 64 receivers' lse / center ((h T / BS, BS) views)
-        tma.async_copy_global_to_shared(lse_desc, [row // BS, 0], bar.index(slot), lcsm.index(2 * slot), pred=pred)
-        tma.async_copy_global_to_shared(center_desc, [row // BS, 0], bar.index(slot), lcsm.index(2 * slot + 1),
-          pred=pred)
-    tma.async_copy_global_to_shared(q_desc, [row, 0], bar.index(slot), qsm.index(2 * slot), pred=pred)
-    tma.async_copy_global_to_shared(q_desc, [row, 32], bar.index(slot), qsm.index(2 * slot + 1), pred=pred)
-    tma.async_copy_global_to_shared(h_desc, [row, 0], bar.index(slot), hsm.index(2 * slot), pred=pred)
-    tma.async_copy_global_to_shared(h_desc, [row, 32], bar.index(slot), hsm.index(2 * slot + 1), pred=pred)
+    tma.async_copy_global_to_shared(q_desc, [row, 0], bar.index(slot), qsm.index(slot), pred=pred)
+    tma.async_copy_global_to_shared(h_desc, [row, 0], bar.index(slot), hsm.index(slot), pred=pred)
     tma.async_copy_global_to_shared(f2_desc, [row, 0], bar.index(slot), f2sm.index(slot), pred=pred)
     tma.async_copy_global_to_shared(g2_desc, [row, 0], bar.index(slot), g2sm.index(slot), pred=pred)
     tma.async_copy_global_to_shared(xy_desc, [row, 0], bar.index(slot), xysm.index(slot), pred=pred)
@@ -56,7 +52,7 @@ def _issue(q_desc, h_desc, f2_desc, g2_desc, xy_desc, bar, qsm, hsm, f2sm, g2sm,
 @gluon.jit
 def _half_response(px, py, qx, qy, qxy, rx, ry, s1, s2, Raw, Cos, Sin, base, target, half: gl.constexpr,
     Sigma: gl.constexpr, layout: gl.constexpr):
-    """The key response of directions half * 32 + j (pair j): moment_kernels._key_perturbation_geometry's step."""
+    """The key response of directions half * 32 + j (pair j): a finite step of the raw key through the norm and RoPE."""
     j = gl.arange(0, 32, gl.SliceLayout(0, layout))
     dims = gl.arange(0, 64, gl.SliceLayout(0, layout))
     raw = gl.load(Raw + base + target[:, None] * 64 + dims[None, :])
@@ -79,31 +75,21 @@ def _half_response(px, py, qx, qy, qxy, rx, ry, s1, s2, Raw, Cos, Sin, base, tar
 
 
 @gluon.jit
-def _key_gluon_kernel(k_desc, v_desc, q_desc, h_desc, f2_desc, g2_desc, xy_desc, Raw, LSE, Center, Cos, Sin, Out,
-    OutMap, OUT_LAYER, OUT_TOKEN, lse_desc, center_desc,
+def _key_gluon_kernel(k_desc, v_desc, q_desc, h_desc, f2_desc, g2_desc, xy_desc, Raw, Cos, Sin, Out,
+    OutMap, OUT_LAYER, OUT_TOKEN, lse_desc, center_desc, ValueOut, VALUE_LAYER, VALUE_TOKEN,
     T: gl.constexpr, Window: gl.constexpr, Sigma: gl.constexpr, BT: gl.constexpr, BS: gl.constexpr,
-    STAGES: gl.constexpr, OUT_H: gl.constexpr, OUT_MAPPED: gl.constexpr, num_warps: gl.constexpr,
-    PF: gl.constexpr = False, QK16: gl.constexpr = False):
+    STAGES: gl.constexpr, OUT_H: gl.constexpr, num_warps: gl.constexpr):
     head = gl.program_id(0)
     t0 = gl.program_id(1) * BT
     base = head * T
-    if QK16:  # bf16 keys / values / queries / hub (the query moments' copies)
-        ksm = gl.allocate_shared_memory(gl.bfloat16, [2, BT, 32], k_desc.layout)
-        vsm = gl.allocate_shared_memory(gl.bfloat16, [2, BT, 32], k_desc.layout)
-        qsm = gl.allocate_shared_memory(gl.bfloat16, [2 * STAGES, BS, 32], q_desc.layout)
-        hsm = gl.allocate_shared_memory(gl.bfloat16, [2 * STAGES, BS, 32], q_desc.layout)
-    else:
-        ksm = gl.allocate_shared_memory(gl.float32, [2, BT, 32], k_desc.layout)
-        vsm = gl.allocate_shared_memory(gl.float32, [2, BT, 32], k_desc.layout)
-        qsm = gl.allocate_shared_memory(gl.float32, [2 * STAGES, BS, 32], q_desc.layout)
-        hsm = gl.allocate_shared_memory(gl.float32, [2 * STAGES, BS, 32], q_desc.layout)
+    ksm = gl.allocate_shared_memory(gl.bfloat16, [BT, 64], k_desc.layout)
+    vsm = gl.allocate_shared_memory(gl.bfloat16, [BT, 64], k_desc.layout)
+    qsm = gl.allocate_shared_memory(gl.bfloat16, [STAGES, BS, 64], q_desc.layout)
+    hsm = gl.allocate_shared_memory(gl.bfloat16, [STAGES, BS, 64], q_desc.layout)
     f2sm = gl.allocate_shared_memory(gl.bfloat16, [STAGES, BS, 64], f2_desc.layout)
     g2sm = gl.allocate_shared_memory(gl.bfloat16, [STAGES, BS, 64], f2_desc.layout)
     xysm = gl.allocate_shared_memory(gl.bfloat16, [STAGES, BS, 32], xy_desc.layout)
-    if PF:
-        lcsm = gl.allocate_shared_memory(gl.float32, [2 * STAGES, 1, BS], lse_desc.layout)
-    else:
-        lcsm = None
+    lcsm = gl.allocate_shared_memory(gl.float32, [2 * STAGES, 1, BS], lse_desc.layout)
     kbar = gl.allocate_shared_memory(gl.int64, [1], mbarrier.MBarrierLayout())
     bar = gl.allocate_shared_memory(gl.int64, [STAGES, 1], mbarrier.MBarrierLayout())
     mbarrier.init(kbar, count=1)
@@ -111,17 +97,15 @@ def _key_gluon_kernel(k_desc, v_desc, q_desc, h_desc, f2_desc, g2_desc, xy_desc,
         mbarrier.init(bar.index(i), count=1)
     first = t0 // BS
     last = gl.minimum((t0 + BT - 1 + Window) // BS + 1, T // BS)
-    mbarrier.expect(kbar, 2 * BT * 64 * (2 if QK16 else 4))
-    tma.async_copy_global_to_shared(k_desc, [base + t0, 0], kbar, ksm.index(0))
-    tma.async_copy_global_to_shared(k_desc, [base + t0, 32], kbar, ksm.index(1))
-    tma.async_copy_global_to_shared(v_desc, [base + t0, 0], kbar, vsm.index(0))
-    tma.async_copy_global_to_shared(v_desc, [base + t0, 32], kbar, vsm.index(1))
+    mbarrier.expect(kbar, 2 * BT * 64 * 2)
+    tma.async_copy_global_to_shared(k_desc, [base + t0, 0], kbar, ksm)
+    tma.async_copy_global_to_shared(v_desc, [base + t0, 0], kbar, vsm)
     for i in gl.static_range(STAGES - 1):
         _issue(q_desc, h_desc, f2_desc, g2_desc, xy_desc, bar, qsm, hsm, f2sm, g2sm, xysm, i,
-          base + (first + i) * BS, first + i < last, BS, lse_desc, center_desc, lcsm, PF, QK16)
+          base + (first + i) * BS, first + i < last, BS, lse_desc, center_desc, lcsm)
 
     mma_s: gl.constexpr = gl.NVMMADistributedLayout(version=[3, 0], warps_per_cta=[num_warps, 1],
-      instr_shape=[16, BS, 16 if QK16 else 8])
+      instr_shape=[16, BS, 16])
     mma_f: gl.constexpr = gl.NVMMADistributedLayout(version=[3, 0], warps_per_cta=[num_warps, 1],
       instr_shape=[16, 64, 16])
     mma_x: gl.constexpr = gl.NVMMADistributedLayout(version=[3, 0], warps_per_cta=[num_warps, 1],
@@ -134,6 +118,7 @@ def _key_gluon_kernel(k_desc, v_desc, q_desc, h_desc, f2_desc, g2_desc, xy_desc,
     q2 = gl.zeros([BT, 64], gl.float32, mma_f)
     r2 = gl.zeros([BT, 64], gl.float32, mma_f)
     qxy = gl.zeros([BT, 32], gl.float32, mma_x)
+    raw64 = gl.zeros([BT, 64], gl.float32, mma_f)
     s1 = gl.zeros([BT], gl.float32, gl.SliceLayout(1, mma_s))
     s2 = gl.zeros([BT], gl.float32, gl.SliceLayout(1, mma_s))
     zero_s = gl.zeros([BT, BS], gl.float32, mma_s)
@@ -144,22 +129,14 @@ def _key_gluon_kernel(k_desc, v_desc, q_desc, h_desc, f2_desc, g2_desc, xy_desc,
         gl.thread_barrier()  # every warp is done with the slot refilled now
         nxt = it + STAGES - 1
         _issue(q_desc, h_desc, f2_desc, g2_desc, xy_desc, bar, qsm, hsm, f2sm, g2sm, xysm,
-          (n + STAGES - 1) % STAGES, base + nxt * BS, nxt < last, BS, lse_desc, center_desc, lcsm, PF, QK16)
+          (n + STAGES - 1) % STAGES, base + nxt * BS, nxt < last, BS, lse_desc, center_desc, lcsm)
         mbarrier.wait(bar.index(slot), (n // STAGES) & 1)
-        logit = warpgroup_mma(ksm.index(0), qsm.index(2 * slot).permute((1, 0)), zero_s, use_acc=False,
-          is_async=True)
-        logit = warpgroup_mma(ksm.index(1), qsm.index(2 * slot + 1).permute((1, 0)), logit, is_async=True)
-        score = warpgroup_mma(vsm.index(0), hsm.index(2 * slot).permute((1, 0)), zero_s, use_acc=False,
-          is_async=True)
-        score = warpgroup_mma(vsm.index(1), hsm.index(2 * slot + 1).permute((1, 0)), score, is_async=True)
+        logit = warpgroup_mma(ksm, qsm.index(slot).permute((1, 0)), zero_s, use_acc=False, is_async=True)
+        score = warpgroup_mma(vsm, hsm.index(slot).permute((1, 0)), zero_s, use_acc=False, is_async=True)
         receiver = it * BS + cols
-        if PF:
-            lc = lcsm._reinterpret(gl.float32, [2 * STAGES, BS], gl.SwizzledSharedLayout(1, 1, 1, [0]))
-            lse = lc.index(2 * slot).load(gl.SliceLayout(0, mma_s))
-            center = lc.index(2 * slot + 1).load(gl.SliceLayout(0, mma_s))
-        else:
-            lse = gl.load(LSE + base + receiver)
-            center = gl.load(Center + base + receiver)
+        lc = lcsm._reinterpret(gl.float32, [2 * STAGES, BS], gl.SwizzledSharedLayout(1, 1, 1, [0]))
+        lse = lc.index(2 * slot).load(gl.SliceLayout(0, mma_s))
+        center = lc.index(2 * slot + 1).load(gl.SliceLayout(0, mma_s))
         logit, score = warpgroup_mma_wait(0, deps=[logit, score])
         logit = logit * 0.125
         a = gl.exp2((logit - lse[None, :]) * LOG2E)
@@ -183,11 +160,20 @@ def _key_gluon_kernel(k_desc, v_desc, q_desc, h_desc, f2_desc, g2_desc, xy_desc,
         q2 = warpgroup_mma(w2d, g2sm.index(slot), q2, is_async=True)
         qxy = warpgroup_mma(w2x, xysm.index(slot), qxy, is_async=True)
         r2 = warpgroup_mma(w2ld, f2sm.index(slot), r2, is_async=True)
-        p2, q2, qxy, r2, w1d, w2d, w2x, w2ld = warpgroup_mma_wait(0, deps=[p2, q2, qxy, r2, w1d, w2d, w2x, w2ld])
+        p2, q2, qxy, r2, w1d, w2d, w2x, w2ld = warpgroup_mma_wait(
+            0, deps=[p2, q2, qxy, r2, w1d, w2d, w2x, w2ld])
+        probability = gl.convert_layout(a.to(gl.bfloat16), a_f)
+        raw64 = warpgroup_mma(probability, hsm.index(slot), raw64, is_async=True)
+        raw64, probability = warpgroup_mma_wait(0, deps=[raw64, probability])
         n += 1
     mbarrier.invalidate(kbar)
     for i in gl.static_range(STAGES):
         mbarrier.invalidate(bar.index(i))
+    value_rows = t0 + gl.arange(0, BT, gl.SliceLayout(1, mma_f))
+    value_cols = gl.arange(0, 64, gl.SliceLayout(0, mma_f))
+    value_start = (head // OUT_H).to(gl.int64) * VALUE_LAYER + (head % OUT_H) * 64
+    value_ptr = ValueOut + value_start + value_rows[:, None].to(gl.int64) * VALUE_TOKEN + value_cols[None, :]
+    gl.store(value_ptr, raw64)
     # the response per direction: pair j's sums at columns 2 j (x) and 2 j + 1 (y)
     out_l: gl.constexpr = gl.BlockedLayout([1, 1], [4, 8], [num_warps, 1], [1, 0])
     px, py = gl.split(gl.reshape(gl.convert_layout(p2, gl.BlockedLayout([1, 2], [4, 8], [num_warps, 1], [1, 0])),
@@ -207,8 +193,7 @@ def _key_gluon_kernel(k_desc, v_desc, q_desc, h_desc, f2_desc, g2_desc, xy_desc,
     s2 = gl.convert_layout(s2, gl.SliceLayout(1, out_l))
     rows = t0 + gl.arange(0, BT, gl.SliceLayout(1, out_l))
     layer = head // OUT_H
-    if OUT_MAPPED:
-        layer = gl.load(OutMap + layer)
+    layer = gl.load(OutMap + layer)
     start = layer.to(gl.int64) * OUT_LAYER + (head % OUT_H) * 64
     j = gl.arange(0, 32, gl.SliceLayout(0, out_l))
     for half in gl.static_range(2):
@@ -216,31 +201,27 @@ def _key_gluon_kernel(k_desc, v_desc, q_desc, h_desc, f2_desc, g2_desc, xy_desc,
         gl.store(Out + start + rows[:, None].to(gl.int64) * OUT_TOKEN + (half * 32 + j)[None, :], resp)
 
 
-def key_scan_gluon(qp, kp, k_raw, lse, values, hub, center, cos, sin, window, sigma, with_values, out_heads=1,
-                   key=None, layers=None, **over):
-    """moment_kernels._key_scan's arguments and result (with_values False only)."""
-    assert not with_values
+def key_values_into(q, k, k_raw, lse, values, hub, center, cos, sin, window, sigma, heads, key_out, layers):
+    """One bf16 attention scan for the key moments, written into key_out, and the raw value credits, returned: the
+    (rows, T, 64) operands are heads of rows // heads layers, and both outputs are by token, (layers, T, heads *
+    64), key_out at the index layers (int32) gives each layer."""
+    assert all(z.dtype == torch.bfloat16 for z in (q, k, values, hub)) and layers is not None
     h, t, d = k_raw.shape
     assert d == 64
-    cfg = dict(CONFIG, **over)
-    bt, bs = cfg['BT'], cfg['BS']
-    shape = (h // out_heads, t, out_heads * d)
-    key = k_raw.new_empty(shape) if key is None else key
-    assert key.stride(2) == 1 and t % bt == 0 and t % bs == 0
-    q2 = qp.contiguous().view(h * t, 64)
-    f2 = torch.empty((h * t, 64), device=qp.device, dtype=torch.bfloat16)
+    bt, bs = CONFIG['BT'], CONFIG['BS']
+    assert key_out.stride(2) == 1 and t % bt == 0 and t % bs == 0
+    raw_out = torch.empty((h // heads, t, heads * d), dtype=torch.float32, device=q.device)
+    q2 = q.contiguous().view(h * t, 64)
+    f2 = torch.empty((h * t, 64), device=q.device, dtype=torch.bfloat16)
     g2 = torch.empty_like(f2)
-    xy = torch.empty((h * t, 32), device=qp.device, dtype=torch.bfloat16)
+    xy = torch.empty((h * t, 32), device=q.device, dtype=torch.bfloat16)
     _features_kernel[(h * t // 64,)](q2, f2, g2, xy, BLOCK=64, num_warps=4)
-    qk16 = kp.dtype == torch.bfloat16  # (the query moments' bf16 q / k / values / hub)
-    qk_gl = gl.bfloat16 if qk16 else gl.float32
-    f32k = gl.NVMMASharedLayout.get_default_for([bt, 32], qk_gl)
-    f32s = gl.NVMMASharedLayout.get_default_for([bs, 32], qk_gl)
-    k_desc = TensorDescriptor.from_tensor(kp.contiguous().view(h * t, 64), [bt, 32], f32k)
-    v_desc = TensorDescriptor.from_tensor(values.contiguous().view(h * t, 64), [bt, 32], f32k)
-    q_desc = TensorDescriptor.from_tensor(q2, [bs, 32], f32s)
-    h_desc = TensorDescriptor.from_tensor(hub.contiguous().view(h * t, 64), [bs, 32], f32s)
+    f32k = gl.NVMMASharedLayout.get_default_for([bt, 64], gl.bfloat16)
     b64 = gl.NVMMASharedLayout.get_default_for([bs, 64], gl.bfloat16)
+    k_desc = TensorDescriptor.from_tensor(k.contiguous().view(h * t, 64), [bt, 64], f32k)
+    v_desc = TensorDescriptor.from_tensor(values.contiguous().view(h * t, 64), [bt, 64], f32k)
+    q_desc = TensorDescriptor.from_tensor(q2, [bs, 64], b64)
+    h_desc = TensorDescriptor.from_tensor(hub.contiguous().view(h * t, 64), [bs, 64], b64)
     f2_desc = TensorDescriptor.from_tensor(f2, [bs, 64], b64)
     g2_desc = TensorDescriptor.from_tensor(g2, [bs, 64], b64)
     xy_desc = TensorDescriptor.from_tensor(xy, [bs, 32], gl.NVMMASharedLayout.get_default_for([bs, 32], gl.bfloat16))
@@ -248,8 +229,7 @@ def key_scan_gluon(qp, kp, k_raw, lse, values, hub, center, cos, sin, window, si
     lse_desc = TensorDescriptor.from_tensor(lse.contiguous().view(h * t // bs, bs), [1, bs], rows32)
     center_desc = TensorDescriptor.from_tensor(center.contiguous().view(h * t // bs, bs), [1, bs], rows32)
     _key_gluon_kernel[(h, t // bt)](k_desc, v_desc, q_desc, h_desc, f2_desc, g2_desc, xy_desc, k_raw.contiguous(),
-      lse.contiguous(), center.contiguous(), cos.contiguous(), sin.contiguous(), key,
-      key if layers is None else layers, key.stride(0), key.stride(1), lse_desc, center_desc, T=t, Window=window,
-      Sigma=sigma, BT=bt, BS=bs, STAGES=cfg['STAGES'], OUT_H=out_heads, OUT_MAPPED=layers is not None,
-      PF=bool(cfg['PF']), QK16=qk16, num_warps=bt // 16)
-    return key.view(h, t, d) if out_heads == 1 else key, key.view(h, t, d) if out_heads == 1 else key
+      cos.contiguous(), sin.contiguous(), key_out, layers, key_out.stride(0), key_out.stride(1), lse_desc, center_desc,
+      raw_out, raw_out.stride(0), raw_out.stride(1), T=t, Window=window, Sigma=sigma, BT=bt, BS=bs,
+      STAGES=CONFIG['STAGES'], OUT_H=heads, num_warps=bt // 16)
+    return raw_out
