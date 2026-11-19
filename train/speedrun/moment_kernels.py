@@ -1,37 +1,18 @@
-"""Faster key / value / query-moment credit kernels for run.py's Cut (snapshot 0beafd8), numerically the reference's.
+"""Query-moment and identity key-moment kernels (from #56's moment_kernels.py).
 
-Drop-in replacements (same inputs and outputs as the reference functions):
-- implicit_key_context(q, k, values, hub, window) -> (lse, center): tiles of 64 queries (reference: 16).
-- moment_query_scores(q, k, v, hub, raw, sq, side, cos, sin, lse, hub_out, steps, out, repeat, window): the
-  reference's programs 2 and 3 of each token tile (repeat = 4) recomputed the moment sums of programs 0 and 1 (the
-  feature pairs are i % 32): each program now sums one half of the pairs and writes both raw coordinates of each
-  pair; the keys' bf16 pair operands are formed once per call (_pair_operands), not per program and key tile.
-- key_credits(qp, kp, k_raw, lse, values, hub, center, cos, sin, window, sigma) -> key: batched_key_scores' key scan
-  (tiles of 64 targets, wgmma).
-- value_credits(context, corrected, window) -> (raw, terminal).
-
-The value credit split by dependency (raw = sum p * hub needs no descending chain, and the chain only reads raw;
-terminal = sum p * corrected needs the chain):
-- raw_value_credits(q, k, lse, hub, window) / terminal_value_credits(q, k, lse, corrected, window): one 64-channel
-  pass over a stack of layers (heads of several layers of one window size along the first axis).
-- key_and_raw_value_credits(...) -> (key, raw): the key scan with the raw value credit in the same pass.
-
-`*_by_token` variants (key_credits, key_and_raw_value_credits, moment_query_scores, raw/terminal_value_credits) write
-(layers, T, heads * 64) fp32 directly, the layout the gradient reassembly reads (layer j's credit is out[j], a view),
-and terminal_value_credits_by_token reads corrected in that layout too: no transpose / reshape / cat / .float() copies.
+- _pair_operands, _by_token and _query_response: the per-token operands and the degree-2 softmax moment response
+  that the sampled query credits (query_sampling.py) share with the identity phase.
+- _moment_query_scores: the identity phase's query credits (every token).
+- moment_key_scores: the identity phase's key credits and value sums.
 """
 import torch
 import triton
 import triton.language as tl
 from triton.language.extra import libdevice
 
-PREC = 'tf32'  # the key / value credit kernels' logits and scores
-# measured (bench.py, one H100, CUDA graph replay)
+PREC = 'tf32'  # the lse / center pass's logits and scores (query_context)
 IMPLICIT_CONFIG = dict(BM=64, BN=64, num_warps=4, num_stages=2)
 MOMENT_CONFIG = dict(PAIRS=16, BLOCK_T=32, BLOCK_S=64, num_warps=4, num_stages=3)
-KEY_CONFIG = dict(BT=64, BS=32, num_warps=4, num_stages=3)
-VALUE_CONFIG = {64: dict(BT=128, BS=128, num_warps=8, num_stages=3),  # by channels
-                128: dict(BT=64, BS=64, num_warps=4, num_stages=3)}
 
 
 # --- per-token operands ------------------------------------------------------------------------------------------
@@ -39,8 +20,7 @@ VALUE_CONFIG = {64: dict(BT=128, BS=128, num_warps=8, num_stages=3),  # by chann
 @triton.jit
 def _pair_features(X, F2, F4, XY, T: tl.constexpr, D: tl.constexpr, BLOCK: tl.constexpr):
     """The query moments' bf16 dot operands of each key of X (rows, T, D), from its pairs' scaled coordinates
-    x = X[i] / sqrt(D), y = X[i + D / 2], pair-major: F2 = (x, y), F4 = (x, x^2, y, y^2) and XY = x y, as the
-    reference kernel forms them in its loop (there once per program and key tile)."""
+    x = X[i] / sqrt(D), y = X[i + D / 2], pair-major: F2 = (x, y), F4 = (x, x^2, y, y^2) and XY = x y."""
     J: tl.constexpr = D // 2
     row, tile = tl.program_id(0), tl.program_id(1)
     token = row.to(tl.int64) * T + tile * BLOCK + tl.arange(0, BLOCK)
@@ -74,132 +54,12 @@ def _by_token(row, H: tl.constexpr, LAYER, TOKEN, C: tl.constexpr, Map=None, MAP
     return layer.to(tl.int64) * LAYER + (row % H) * C
 
 
-# --- lse and center ------------------------------------------------------------------------------------------------
-
-@triton.jit
-def _implicit_key_statistics(Q, K, Values, Hub, LSE, Center, T: tl.constexpr, Window: tl.constexpr,
-    BM: tl.constexpr, BN: tl.constexpr, PREC: tl.constexpr):
-    tile, head = tl.program_id(0), tl.program_id(1)
-    query = tile * BM + tl.arange(0, BM)
-    dims = tl.arange(0, 64)
-    src = tl.arange(0, BN)
-    base = head * T * 64
-    q = tl.load(Q + base + query[:, None] * 64 + dims[None, :])
-    hub = tl.load(Hub + base + query[:, None] * 64 + dims[None, :])
-    maximum = tl.full((BM,), float('-inf'), tl.float32)
-    total = tl.zeros((BM,), tl.float32)
-    score_sum = tl.zeros((BM,), tl.float32)
-    first = tl.maximum(tile * BM - Window, 0) // BN
-    last = tl.cdiv((tile + 1) * BM, BN)
-    for block in range(first, last):
-        source = block * BN + src
-        k = tl.load(K + base + source[:, None] * 64 + dims[None, :])
-        v = tl.load(Values + base + source[:, None] * 64 + dims[None, :])
-        logits = tl.dot(q, tl.trans(k), input_precision=PREC) * 0.125
-        scores = tl.dot(hub, tl.trans(v), input_precision=PREC)
-        allowed = (source[None, :] <= query[:, None]) & (query[:, None] - source[None, :] <= Window)
-        logits = tl.where(allowed, logits, float('-inf'))
-        next_max = tl.maximum(maximum, tl.max(logits, 1))
-        safe_max = tl.where(next_max == float('-inf'), 0.0, next_max)
-        rescale = tl.exp(maximum - safe_max)
-        prob = tl.exp(logits - safe_max[:, None])
-        total = total * rescale + tl.sum(prob, 1)
-        score_sum = score_sum * rescale + tl.sum(prob * scores, 1)
-        maximum = next_max
-    tl.store(LSE + head * T + query, maximum + tl.log(total))
-    tl.store(Center + head * T + query, score_sum / total)
-
-
-@triton.jit
-def _implicit_block(q, hub, K, Values, base, query, block, maximum, total, score_sum, Window: tl.constexpr,
-                    BN: tl.constexpr, PREC: tl.constexpr, MASKED: tl.constexpr):
-    """One key block of _implicit_key_statistics' online softmax; MASKED for blocks the causal window cuts."""
-    dims = tl.arange(0, 64)
-    source = block * BN + tl.arange(0, BN)
-    k = tl.load(K + base + source[:, None] * 64 + dims[None, :])
-    v = tl.load(Values + base + source[:, None] * 64 + dims[None, :])
-    logits = tl.dot(q, tl.trans(k), input_precision=PREC) * 0.125
-    scores = tl.dot(hub, tl.trans(v), input_precision=PREC)
-    if MASKED:
-        allowed = (source[None, :] <= query[:, None]) & (query[:, None] - source[None, :] <= Window)
-        logits = tl.where(allowed, logits, float('-inf'))
-    next_max = tl.maximum(maximum, tl.max(logits, 1))
-    safe_max = next_max
-    if MASKED:
-        safe_max = tl.where(next_max == float('-inf'), 0.0, next_max)
-    rescale = tl.exp(maximum - safe_max)
-    prob = tl.exp(logits - safe_max[:, None])
-    total = total * rescale + tl.sum(prob, 1)
-    score_sum = score_sum * rescale + tl.sum(prob * scores, 1)
-    return next_max, total, score_sum
-
-
-@triton.jit
-def _implicit_key_statistics_edges(Q, K, Values, Hub, LSE, Center, T: tl.constexpr, Window: tl.constexpr,
-                                   B: tl.constexpr, PREC: tl.constexpr):
-    """_implicit_key_statistics for square tiles (B queries, B keys; Window % B == 0): only the diagonal block and the
-    window's first block are masked, the blocks between are whole; the heaviest query tiles launch first."""
-    tile, head = T // B - 1 - tl.program_id(0), tl.program_id(1)
-    query = tile * B + tl.arange(0, B)
-    dims = tl.arange(0, 64)
-    base = head * T * 64
-    q = tl.load(Q + base + query[:, None] * 64 + dims[None, :])
-    hub = tl.load(Hub + base + query[:, None] * 64 + dims[None, :])
-    maximum = tl.full((B,), float('-inf'), tl.float32)
-    total = tl.zeros((B,), tl.float32)
-    score_sum = tl.zeros((B,), tl.float32)
-    maximum, total, score_sum = _implicit_block(q, hub, K, Values, base, query, tile, maximum, total, score_sum,
-                                                Window, B, PREC, True)
-    start = tile * B - Window
-    lo = 0
-    if start >= 0:
-        lo = start // B
-        maximum, total, score_sum = _implicit_block(q, hub, K, Values, base, query, lo, maximum, total, score_sum,
-                                                    Window, B, PREC, True)
-        lo += 1
-    for block in range(lo, tile):
-        maximum, total, score_sum = _implicit_block(q, hub, K, Values, base, query, block, maximum, total, score_sum,
-                                                    Window, B, PREC, False)
-    tl.store(LSE + head * T + query, maximum + tl.log(total))
-    tl.store(Center + head * T + query, score_sum / total)
-
-
-def _implicit_key_context(q: torch.Tensor, k: torch.Tensor, values: torch.Tensor, hub: torch.Tensor,
-                          window: int, edges: bool = False) -> tuple[torch.Tensor, torch.Tensor]:
-    h, t, _ = q.shape
-    q, k, values, hub = (z.contiguous() for z in (q, k, values, hub))
-    lse = torch.empty((h, t), device=q.device)
-    center = torch.empty_like(lse)
-    c = IMPLICIT_CONFIG
-    if edges:
-        assert c['BM'] == c['BN'] and window % c['BN'] == 0 and t % c['BM'] == 0
-        _implicit_key_statistics_edges[(t // c['BM'], h)](q, k, values, hub, lse, center, T=t, Window=window,
-            B=c['BM'], PREC=PREC, num_warps=c['num_warps'], num_stages=c['num_stages'])
-    else:
-        _implicit_key_statistics[(t // c['BM'], h)](q, k, values, hub, lse, center, T=t, Window=window, BM=c['BM'],
-            BN=c['BN'], PREC=PREC, num_warps=c['num_warps'], num_stages=c['num_stages'])
-    return lse, center
-
-
-@torch.library.custom_op('moment_kernels::implicit_key_context_edges', mutates_args=())
-def implicit_key_context_edges(q: torch.Tensor, k: torch.Tensor, values: torch.Tensor, hub: torch.Tensor,
-                               window: int) -> tuple[torch.Tensor, torch.Tensor]:
-    """implicit_key_context (same outputs up to summation order) masking only the key blocks the window cuts."""
-    return _implicit_key_context(q, k, values, hub, window, edges=True)
-
-
-@implicit_key_context_edges.register_fake
-def _(q, k, values, hub, window):
-    h, t, _ = q.shape
-    return q.new_empty((h, t), dtype=torch.float32), q.new_empty((h, t), dtype=torch.float32)
-
-
 # --- query moments -------------------------------------------------------------------------------------------------
 
 @triton.jit
 def _query_coefficients(raw_ptr, sq_ptr, steps_ptr, cos_ptr, sin_ptr, row, BH, T, offs, d, M, RAW_GPU, RAW_STRIDE,
     D: tl.constexpr):
-    """The reference's _closed_coefficients for raw coordinates d."""
+    """The moment response's closed-form coefficients for raw coordinates d."""
     i = d % (D // 2)
     n = (row % BH).to(tl.int64) * T + offs
     raw = tl.load(raw_ptr + (n // M * RAW_GPU + n % M * RAW_STRIDE)[:, None] + d[None, :]).to(tl.float32)
@@ -257,8 +117,8 @@ def _moment_queries_kernel(q_ptr, k_ptr, v_ptr, hub_ptr, raw_ptr, sq_ptr, f2_ptr
     hubout_ptr, steps_ptr, out_ptr, BH, T, scale, RAW_BLK, RAW_GPU, RAW_STRIDE, M, OUT_BLK, W_STRIDE, OUT_LAYER,
     OUT_TOKEN, out_map, D: tl.constexpr, J: tl.constexpr, BLOCK_T: tl.constexpr, BLOCK_S: tl.constexpr,
     WINDOW: tl.constexpr, OUT_H: tl.constexpr, OUT_MAPPED: tl.constexpr):
-    """The reference's _moment_queries_kernel with each program's J feature pairs (of D // 2) feeding both raw
-    coordinates of each pair (d = pair and d = pair + D // 2)."""
+    """The query moments: each program's J feature pairs (of D // 2) feed both raw coordinates of each pair
+    (d = pair and d = pair + D // 2)."""
     parts: tl.constexpr = D // 2 // J
     i, s0 = tl.program_id(0), (tl.num_programs(1) - 1 - tl.program_id(1)) * BLOCK_S
     row, part = i // parts, i % parts
@@ -318,8 +178,8 @@ def _moment_queries_kernel(q_ptr, k_ptr, v_ptr, hub_ptr, raw_ptr, sq_ptr, f2_ptr
 
 def _moment_query_scores(q, k, v, hub, raw, sq, side, cos, sin, lse, hub_out, steps, out, repeat, window=None,
                          out_heads=0, layers=None, config=None, pair_ops=None):
-    """out: the reference's (1, rows, T, D) bf16, or with out_heads a (rows // out_heads, T, out_heads * D) fp32 view
-    (last stride 1)."""
+    """out: (1, rows, T, D) bf16, or with out_heads a (rows // out_heads, T, out_heads * D) fp32 view (last stride
+    1)."""
     rows, t, d = q.shape
     blocks = raw.shape[1]
     c = config or MOMENT_CONFIG
@@ -335,45 +195,15 @@ def _moment_query_scores(q, k, v, hub, raw, sq, side, cos, sin, lse, hub_out, st
       OUT_H=out_heads, OUT_MAPPED=layers is not None, num_warps=c['num_warps'], num_stages=c['num_stages'])
 
 
-@torch.library.custom_op('moment_kernels::moment_query_scores', mutates_args=('out',))
-def moment_query_scores(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, hub: torch.Tensor, raw: torch.Tensor,
-                        sq: torch.Tensor, side: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, lse: torch.Tensor,
-                        hub_out: torch.Tensor, steps: torch.Tensor, out: torch.Tensor, repeat: int,
-                        window: int | None = None) -> None:
-    _moment_query_scores(q, k, v, hub, raw, sq, side, cos, sin, lse, hub_out, steps, out, repeat, window)
-
-
-@moment_query_scores.register_fake
-def _(q, k, v, hub, raw, sq, side, cos, sin, lse, hub_out, steps, out, repeat, window=None):
-    return None
-
-
-@torch.library.custom_op('moment_kernels::moment_query_scores_into', mutates_args=('out',))
-def moment_query_scores_into(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, hub: torch.Tensor, raw: torch.Tensor,
-                             sq: torch.Tensor, side: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
-                             lse: torch.Tensor, hub_out: torch.Tensor, steps: torch.Tensor, out: torch.Tensor,
-                             window: int | None = None, layers: torch.Tensor | None = None) -> None:
-    """moment_query_scores_by_token into out, a (layers, T, heads * D) fp32 view with last stride 1 (e.g. a column
-    slice of a wider per-layer buffer); heads = out.shape[-1] // D; layers (int32, optional): the out index of each
-    of the rows' layers."""
-    _moment_query_scores(q, k, v, hub, raw, sq, side, cos, sin, lse, hub_out, steps, out, q.shape[-1] // 16, window,
-                         out.shape[-1] // q.shape[-1], layers)
-
-
-@moment_query_scores_into.register_fake
-def _(q, k, v, hub, raw, sq, side, cos, sin, lse, hub_out, steps, out, window=None, layers=None):
-    return None
-
-
 # --- identity-phase key moments -----------------------------------------------------------------------------------
 
 @triton.jit
 def _moment_keys_kernel(q_ptr, k_ptr, v_ptr, hub_ptr, raw_ptr, sq_ptr, side_ptr, cos_ptr, sin_ptr, lse_ptr, hubout_ptr,
     steps_ptr, out_ptr, value_ptr, BH, T, scale, RAW_BLK, RAW_GPU, RAW_STRIDE, M, OUT_BLK, W_STRIDE,
     D: tl.constexpr, BLOCK_T: tl.constexpr, BLOCK_S: tl.constexpr):
-    """The reference key-moment kernel (repeat = 2) with both of a token tile's programs in one: the reference's two
-    programs formed the same moment sums (pairs i % 32) and differed only in the output coordinates (d = pair,
-    pair + 32) and the 32 hub columns of the value sum, so the sums are formed once and the value sum over all 64."""
+    """The key moments (repeat = 2), one program per token tile: both output coordinates of a pair (d = pair,
+    pair + 32) come from the same moment sums (pairs i % 32), formed once; the value sum runs over all 64 hub
+    columns."""
     J: tl.constexpr = D // 2
     row, t0 = tl.program_id(0), tl.program_id(1) * BLOCK_T
     blk = row // BH
@@ -436,8 +266,9 @@ def _moment_keys_kernel(q_ptr, k_ptr, v_ptr, hub_ptr, raw_ptr, sq_ptr, side_ptr,
 KEY_MOMENT_CONFIG = dict(BLOCK_T=64, BLOCK_S=32, num_warps=4, num_stages=3)  # the identity phase's key moments
 
 
-def _moment_key_scores(q, k, v, hub, raw, sq, side, cos, sin, lse, hub_out, steps, out, values, repeat, config=None):
-    c = config or KEY_MOMENT_CONFIG
+def moment_key_scores(q, k, v, hub, raw, sq, side, cos, sin, lse, hub_out, steps, out, values, repeat):
+    """The identity phase's key credits and value sums."""
+    c = KEY_MOMENT_CONFIG
     rows, t, d = q.shape
     blocks = raw.shape[1]
     assert repeat == 2 and d == 64, 'the identity phase\'s call (repeat = head_dim // 32)'
@@ -446,272 +277,3 @@ def _moment_key_scores(q, k, v, hub, raw, sq, side, cos, sin, lse, hub_out, step
       values, rows // blocks, t, d ** -0.5, raw.stride(1), raw.stride(0), raw.stride(2), out.shape[2], out.stride(1),
       out.stride(0), D=d, BLOCK_T=c['BLOCK_T'], BLOCK_S=c['BLOCK_S'], num_warps=c['num_warps'],
       num_stages=c['num_stages'])
-
-
-@torch.library.custom_op('moment_kernels::moment_key_scores', mutates_args=('out', 'values'))
-def moment_key_scores(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, hub: torch.Tensor, raw: torch.Tensor,
-                      sq: torch.Tensor, side: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, lse: torch.Tensor,
-                      hub_out: torch.Tensor, steps: torch.Tensor, out: torch.Tensor, values: torch.Tensor,
-                      repeat: int) -> None:
-    """The identity phase's key credits and value sums (a drop-in for the reference moment_key_scores)."""
-    _moment_key_scores(q, k, v, hub, raw, sq, side, cos, sin, lse, hub_out, steps, out, values, repeat)
-
-
-@moment_key_scores.register_fake
-def _(q, k, v, hub, raw, sq, side, cos, sin, lse, hub_out, steps, out, values, repeat):
-    return None
-
-
-# --- key credits (and the raw value credit) -----------------------------------------------------------------------
-
-@triton.jit
-def _key_perturbation_geometry(Raw, Cos, Sin, base, target, dims, dirs, pair, D: tl.constexpr, Sigma: tl.constexpr):
-    raw = tl.load(Raw + base + target[:, None] * D + dims[None, :])
-    raw_j = tl.load(Raw + base + target[:, None] * D + dirs[None, :])
-    sq = tl.sum(raw * raw, 1)[:, None] / D
-    step = Sigma * tl.maximum(tl.sqrt(sq), 1e-06)
-    ratio = (2 * step * raw_j + step * step) / D / (sq + 1.1920928955078125e-07)
-    ca = libdevice.expm1(-0.5 * libdevice.log1p(ratio))
-    cb = step * libdevice.rsqrt(sq + 1.1920928955078125e-07) * (1 + ca)
-    cs = tl.load(Cos + target[:, None] * (D // 2) + pair[None, :])
-    sn = tl.load(Sin + target[:, None] * (D // 2) + pair[None, :])
-    bu = cb * tl.where(dirs[None, :] < D // 2, cs, sn)
-    bw = cb * tl.where(dirs[None, :] < D // 2, -sn, cs)
-    return (ca, bu, bw, step)
-
-
-@triton.jit
-def _key_scan_kernel(Q, K, Raw, LSE, Values, Hub, Center, Cos, Sin, Out, RawValue, OUT_LAYER, OUT_TOKEN, RAW_LAYER,
-    RAW_TOKEN, OutMap, T: tl.constexpr, D: tl.constexpr,
-    Window: tl.constexpr, Sigma: tl.constexpr, BT: tl.constexpr, BS: tl.constexpr, PREC: tl.constexpr,
-    VALUES: tl.constexpr, OUT_H: tl.constexpr, OUT_MAPPED: tl.constexpr):
-    """The reference's _key_scan_kernel (J = D // 2); with VALUES also the raw value credit sum_s p * hub, as the
-    reference's _value_credit_kernel forms it (bf16 probabilities times hub's bf16 high and low parts)."""
-    J: tl.constexpr = D // 2
-    head = tl.program_id(0)
-    t0 = tl.program_id(1) * BT
-    target = t0 + tl.arange(0, BT)
-    dims = tl.arange(0, D)
-    dirs = tl.arange(0, D)
-    feature_pair = tl.arange(0, J)
-    pair = dirs % (D // 2)
-    base = head * T * D
-    key = tl.load(K + base + target[:, None] * D + dims[None, :])
-    value = tl.load(Values + base + target[:, None] * D + dims[None, :])
-    p2 = tl.zeros((BT, 2 * J), tl.float32)
-    q2 = tl.zeros((BT, 2 * J), tl.float32)
-    qxy = tl.zeros((BT, J), tl.float32)
-    r2 = tl.zeros((BT, 2 * J), tl.float32)
-    acc = tl.zeros((BT, D), tl.float32)
-    s1 = tl.zeros((BT,), tl.float32)
-    s2 = tl.zeros((BT,), tl.float32)
-    first = t0 // BS
-    last = tl.minimum((t0 + BT - 1 + Window) // BS + 1, T // BS)
-    for it in range(first, last):
-        source = it * BS + tl.arange(0, BS)
-        query = tl.load(Q + base + source[:, None] * D + dims[None, :])
-        logit = tl.dot(key, tl.trans(query), input_precision=PREC) * D ** (-0.5)
-        valid = (source[None, :] >= target[:, None]) & (source[None, :] - target[:, None] <= Window)
-        hub = tl.load(Hub + base + source[:, None] * D + dims[None, :])
-        score = tl.dot(value, tl.trans(hub), input_precision=PREC)
-        center = tl.load(Center + head * T + source)
-        c = tl.where(valid, score - center[None, :], 0.0)
-        lse = tl.load(LSE + head * T + source)
-        a = tl.where(valid, tl.exp(logit - lse[None, :]), 0.0)
-        x = tl.load(Q + base + source[:, None] * D + feature_pair[None, :]) * D ** (-0.5)
-        y = tl.load(Q + base + source[:, None] * D + (feature_pair + D // 2)[None, :]) * D ** (-0.5)
-        f2 = tl.reshape(tl.join(x, y), (BS, 2 * J))
-        g2 = tl.reshape(tl.join(x * x, y * y), (BS, 2 * J))
-        xy = x * y
-        w1 = a * c
-        w2 = (0.5 * a - a * a) * c
-        w2l = w2 * logit
-        w1d, w2d, w2ld = (w1.to(tl.bfloat16), w2.to(tl.bfloat16), w2l.to(tl.bfloat16))
-        f2d, g2d, xyd = (f2.to(tl.bfloat16), g2.to(tl.bfloat16), xy.to(tl.bfloat16))
-        p2 += tl.dot(w1d, f2d)
-        q2 += tl.dot(w2d, g2d)
-        qxy += tl.dot(w2d, xyd)
-        r2 += tl.dot(w2ld, f2d)
-        s1 += tl.sum(w1 * logit, 1)
-        s2 += tl.sum(w2 * logit * logit, 1)
-        if VALUES:
-            prob = a.to(tl.bfloat16)
-            hi = hub.to(tl.bfloat16)
-            lo = (hub - hi.to(tl.float32)).to(tl.bfloat16)
-            acc += tl.dot(prob, hi)
-            acc += tl.dot(prob, lo)
-    ca, bu, bw, step = _key_perturbation_geometry(Raw, Cos, Sin, base, target, dims, dirs, pair, D, Sigma)
-    px, py = tl.split(tl.reshape(p2, (BT, J, 2)))
-    qx, qy = tl.split(tl.reshape(q2, (BT, J, 2)))
-    rx, ry = tl.split(tl.reshape(r2, (BT, J, 2)))
-    gather_pair = tl.broadcast_to(pair[None, :], (BT, D))
-    px, py = (tl.gather(px, gather_pair, 1), tl.gather(py, gather_pair, 1))
-    qx, qy = (tl.gather(qx, gather_pair, 1), tl.gather(qy, gather_pair, 1))
-    rx, ry = (tl.gather(rx, gather_pair, 1), tl.gather(ry, gather_pair, 1))
-    qxy = tl.gather(qxy, gather_pair, 1)
-    response = (px * bu + py * bw + qx * bu * bu + qy * bw * bw + 2 * qxy * bu * bw + 2 * ca * (rx * bu + ry * bw)
-      + s1[:, None] * ca + s2[:, None] * ca * ca)
-    start = _by_token(head, OUT_H, OUT_LAYER, OUT_TOKEN, D, OutMap, OUT_MAPPED)
-    tl.store(Out + start + target[:, None] * OUT_TOKEN + dirs[None, :], response / step)
-    if VALUES:
-        start = _by_token(head, OUT_H, RAW_LAYER, RAW_TOKEN, D, OutMap, OUT_MAPPED)
-        tl.store(RawValue + start + target[:, None] * RAW_TOKEN + dims[None, :], acc)
-
-
-def _key_scan(qp, kp, k_raw, lse, values, hub, center, cos, sin, window, sigma, with_values, out_heads=1, key=None,
-              layers=None):
-    """The key credits (and with_values the raw value credits), stacked (rows, T, D) or by token
-    (rows // out_heads, T, out_heads * D); the key credits into key (such a view, last stride 1) when given."""
-    if KEY_IMPL is not None and not with_values and k_raw.shape[-1] == 64:
-        return KEY_IMPL(qp, kp, k_raw, lse, values, hub, center, cos, sin, window, sigma, with_values, out_heads, key,
-                        layers)
-    h, t, d = k_raw.shape
-    shape = (h // out_heads, t, out_heads * d)
-    key = k_raw.new_empty(shape) if key is None else key
-    assert key.shape[1:] == shape[1:] and key.stride(2) == 1 and (layers is not None or key.shape == shape)
-    raw_value = k_raw.new_empty(shape) if with_values else key
-    c = KEY_CONFIG
-    _key_scan_kernel[h, t // c['BT']](qp, kp, k_raw, lse, values, hub, center, cos, sin, key, raw_value,
-        key.stride(0), key.stride(1), raw_value.stride(0), raw_value.stride(1), key if layers is None else layers,
-        T=t, D=d, OUT_MAPPED=layers is not None,
-        Window=window, Sigma=sigma, BT=c['BT'], BS=c['BS'], PREC=PREC, VALUES=with_values, OUT_H=out_heads,
-        num_warps=c['num_warps'], num_stages=c['num_stages'])
-    return key.view(h, t, d) if out_heads == 1 else key, raw_value.view(h, t, d) if out_heads == 1 else raw_value
-
-
-@torch.library.custom_op('moment_kernels::key_credits', mutates_args=())
-def key_credits(qp: torch.Tensor, kp: torch.Tensor, k_raw: torch.Tensor, lse: torch.Tensor, values: torch.Tensor,
-                hub: torch.Tensor, center: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, window: int,
-                sigma: float) -> torch.Tensor:
-    """batched_key_scores' key scan: (heads, tokens, head_dim) contiguous inputs, any number of stacked heads."""
-    return _key_scan(qp, kp, k_raw, lse, values, hub, center, cos, sin, window, sigma, False)[0]
-
-
-@key_credits.register_fake
-def _(qp, kp, k_raw, lse, values, hub, center, cos, sin, window, sigma):
-    return torch.empty_like(k_raw)
-
-
-@torch.library.custom_op('moment_kernels::key_credits_into', mutates_args=('out',))
-def key_credits_into(qp: torch.Tensor, kp: torch.Tensor, k_raw: torch.Tensor, lse: torch.Tensor, values: torch.Tensor,
-                     hub: torch.Tensor, center: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, window: int,
-                     sigma: float, out: torch.Tensor, layers: torch.Tensor | None = None) -> None:
-    """key_credits_by_token into out, a (layers, T, heads * D) view with last stride 1; layers (int32, optional): the
-    out index of each of the rows' layers."""
-    _key_scan(qp, kp, k_raw, lse, values, hub, center, cos, sin, window, sigma, False, out.shape[-1] // k_raw.shape[-1],
-              out, layers)
-
-
-@key_credits_into.register_fake
-def _(qp, kp, k_raw, lse, values, hub, center, cos, sin, window, sigma, out, layers=None):
-    return None
-
-
-# --- value credits -------------------------------------------------------------------------------------------------
-
-@triton.jit
-def _value_credit_kernel(Q, K, LSE, Hub, Out, T: tl.constexpr, Window: tl.constexpr, BT: tl.constexpr,
-    BS: tl.constexpr, Channels: tl.constexpr, PREC: tl.constexpr, IN_H: tl.constexpr, OUT_H: tl.constexpr,
-    IN_LAYER, IN_TOKEN, OUT_LAYER, OUT_TOKEN, OutMap, OUT_MAPPED: tl.constexpr):
-    head, tile = tl.program_id(0), tl.program_id(1)
-    target = tile * BT + tl.arange(0, BT)
-    dims = tl.arange(0, 64)
-    channels = tl.arange(0, Channels)
-    base = head * T * 64
-    key = tl.load(K + base + target[:, None] * 64 + dims[None, :])
-    acc = tl.zeros((BT, Channels), tl.float32)
-    hub_start = _by_token(head, IN_H, IN_LAYER, IN_TOKEN, Channels)
-    first = tile * BT // BS
-    last = tl.minimum((tile * BT + BT - 1 + Window) // BS + 1, T // BS)
-    for it in range(first, last):
-        receiver = it * BS + tl.arange(0, BS)
-        query = tl.load(Q + base + receiver[:, None] * 64 + dims[None, :])
-        hub = tl.load(Hub + hub_start + receiver[:, None] * IN_TOKEN + channels[None, :])
-        lse = tl.load(LSE + head * T + receiver)
-        logits = tl.dot(key, tl.trans(query), input_precision=PREC) * .125
-        valid = (receiver[None, :] >= target[:, None]) & (receiver[None, :] - target[:, None] <= Window)
-        prob = tl.where(valid, tl.exp(logits - lse[None, :]), 0.).to(tl.bfloat16)
-        hi = hub.to(tl.bfloat16)
-        lo = (hub - hi.to(tl.float32)).to(tl.bfloat16)
-        acc += tl.dot(prob, hi)
-        acc += tl.dot(prob, lo)
-    out_start = _by_token(head, OUT_H, OUT_LAYER, OUT_TOKEN, Channels, OutMap, OUT_MAPPED)
-    tl.store(Out + out_start + target[:, None] * OUT_TOKEN + channels[None, :], acc)
-
-
-KEY_IMPL = None  # a replacement for _key_scan's kernel without values (run.py sets key_gluon.key_scan_gluon)
-VALUE_IMPL = None  # a replacement for _value_pass's kernel (run.py sets value_gluon.value_pass_gluon)
-
-
-def _value_pass(q, k, lse, source, window, in_heads=1, out_heads=1, out=None, layers=None):
-    """sum_s p * source: source stacked (rows, T, C) or (in_heads > 1) by token (rows // in_heads, T, in_heads * C);
-    the output stacked or (out_heads > 1) by token likewise, into out (such a view, last stride 1) when given."""
-    if VALUE_IMPL is not None and q.shape[-1] == 64 and source.shape[-1] // in_heads == 64:
-        return VALUE_IMPL(q, k, lse, source, window, in_heads, out_heads, out, layers)
-    h, t, _ = q.shape
-    channels = source.shape[-1] // in_heads
-    out = source.new_empty((h // out_heads, t, out_heads * channels)) if out is None else out
-    assert source.stride(2) == 1 and out.stride(2) == 1
-    c = VALUE_CONFIG[channels]
-    _value_credit_kernel[h, t // c['BT']](q, k, lse, source, out, T=t, Window=window, BT=c['BT'], BS=c['BS'],
-        Channels=channels, PREC=PREC, IN_H=in_heads, OUT_H=out_heads, IN_LAYER=source.stride(0),
-        IN_TOKEN=source.stride(1), OUT_LAYER=out.stride(0), OUT_TOKEN=out.stride(1),
-        OutMap=out if layers is None else layers, OUT_MAPPED=layers is not None, num_warps=c['num_warps'],
-        num_stages=c['num_stages'])
-    return out
-
-
-@torch.library.custom_op('moment_kernels::raw_value_credits', mutates_args=())
-def raw_value_credits(q: torch.Tensor, k: torch.Tensor, lse: torch.Tensor, hub: torch.Tensor,
-                      window: int) -> torch.Tensor:
-    """sum_s p * hub (value_credits' raw output) for (heads, tokens, 64) contiguous inputs, heads stacked freely."""
-    return _value_pass(q, k, lse, hub, window)
-
-
-@raw_value_credits.register_fake
-def _(q, k, lse, hub, window):
-    return torch.empty_like(hub)
-
-
-@torch.library.custom_op('moment_kernels::terminal_value_credits', mutates_args=())
-def terminal_value_credits(q: torch.Tensor, k: torch.Tensor, lse: torch.Tensor, corrected: torch.Tensor,
-                           window: int) -> torch.Tensor:
-    """sum_s p * corrected (value_credits' terminal output), heads stacked freely."""
-    return _value_pass(q, k, lse, corrected.contiguous(), window)
-
-
-@terminal_value_credits.register_fake
-def _(q, k, lse, corrected, window):
-    return torch.empty_like(corrected)
-
-
-def _by_token_shape(x, heads):
-    rows, t, d = x.shape
-    return (rows // heads, t, heads * d)
-
-
-@torch.library.custom_op('moment_kernels::raw_value_credits_by_token', mutates_args=())
-def raw_value_credits_by_token(q: torch.Tensor, k: torch.Tensor, lse: torch.Tensor, hub: torch.Tensor, window: int,
-                               heads: int) -> torch.Tensor:
-    """raw_value_credits as (layers, T, heads * 64) (the rows are heads of rows // heads layers): out[j] is layer
-    j's raw value credit as raw[rows of j].transpose(0, 1).reshape(T, -1)."""
-    return _value_pass(q, k, lse, hub, window, 1, heads)
-
-
-@raw_value_credits_by_token.register_fake
-def _(q, k, lse, hub, window, heads):
-    return hub.new_empty(_by_token_shape(hub, heads))
-
-
-@torch.library.custom_op('moment_kernels::terminal_value_credits_into', mutates_args=('out',))
-def terminal_value_credits_into(q: torch.Tensor, k: torch.Tensor, lse: torch.Tensor, corrected: torch.Tensor,
-                                window: int, out: torch.Tensor, layers: torch.Tensor | None = None) -> None:
-    """terminal_value_credits_by_token into out, a (layers, T, heads * 64) view with last stride 1; corrected may be
-    such a view too (indexed by the rows' layers); layers (int32, optional): the out index of each of them."""
-    heads = corrected.shape[-1] // q.shape[-1]
-    _value_pass(q, k, lse, corrected, window, heads, heads, out, layers)
-
-
-@terminal_value_credits_into.register_fake
-def _(q, k, lse, corrected, window, out, layers=None):
-    return None

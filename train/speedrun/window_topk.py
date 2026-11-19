@@ -71,30 +71,12 @@ def _store_in_torch_order(top, lane, Tops, Indices, row, N: tl.constexpr, K: tl.
 
 
 @triton.jit
-def _window_topk_torch_kernel(Scores, Tops, Indices, N: tl.constexpr, K: tl.constexpr, LOG_N: tl.constexpr):
-    """torch.topk(scores, K) of bf16 rows bit for bit, order included: the selection by K repeated maxima of the packed
-    (value, N - 1 - index) as _window_topk16_kernel, then the selected in torch's gather order (above the K-th value by
-    index, then its ties by index) through ATen's 32-slot bitonic sort."""
-    row = tl.program_id(0).to(tl.int64)
-    cols = tl.arange(0, N)
-    b = tl.load(Scores + row * N + cols).to(tl.int16, bitcast=True).to(tl.int32)
-    ordered = tl.where(b < 0, b ^ 0x7FFF, b)
-    packed = (ordered << LOG_N) | (N - 1 - cols)
-    lane = tl.arange(0, 32)
-    top = tl.full([32], -2147483648, tl.int32)
-    for j in tl.static_range(K):
-        m = tl.max(packed, 0)
-        top = tl.where(lane == j, m, top)
-        packed = tl.where(packed == m, -2147483648, packed)
-    _store_in_torch_order(top, lane, Tops, Indices, row, N, K, LOG_N)
-
-
-@triton.jit
 def _window_topk_pruned_kernel(Scores, Tops, Indices, N: tl.constexpr, K: tl.constexpr, LOG_N: tl.constexpr,
                                G: tl.constexpr):
-    """_window_topk_torch_kernel's selection over K groups only: the packed keys are distinct, so every top-K key lies in
-    one of the K groups (of G consecutive columns) with the largest maxima; those groups are loaded again and the K
-    repeated maxima taken over their K * G keys."""
+    """torch.topk(scores, K) of bf16 rows bit for bit, order included, selecting over K groups only: the packed
+    (value, N - 1 - index) keys are distinct, so every top-K key lies in one of the K groups (of G consecutive
+    columns) with the largest maxima; those groups are loaded again, the K repeated maxima taken over their K * G
+    keys, and the selected stored in torch's order."""
     row = tl.program_id(0).to(tl.int64)
     NG: tl.constexpr = N // G
     cols = tl.arange(0, NG)[:, None] * G + tl.arange(0, G)[None, :]
@@ -122,12 +104,12 @@ def _packed_keys(Scores, row, cols, N: tl.constexpr, LOG_N: tl.constexpr):
     return (tl.where(b < 0, b ^ 0x7FFF, b) << LOG_N) | (N - 1 - cols)
 
 
-@torch.library.custom_op('visit_kernel::window_topk_pruned', mutates_args=())
 def window_topk_pruned(scores: torch.Tensor, count: int) -> tuple[torch.Tensor, torch.Tensor]:
-    """window_topk (bitwise) by _window_topk_pruned_kernel (groups of N / (16 count))."""
+    """scores.topk(count, dim=-1) (values, indices) exactly, for bf16 rows of N = 2^m <= 4096 and count = 2^j <= 32
+    with N >= 16 count, by _window_topk_pruned_kernel (groups of N / (16 count) columns)."""
     n = scores.shape[-1]
-    if scores.dtype != torch.bfloat16 or n & (n - 1) or n > 4096 or count > 32 or count & (count - 1) or n < 16 * count:
-        return window_topk(scores, count)
+    assert scores.dtype == torch.bfloat16 and not n & (n - 1) and not count & (count - 1)
+    assert 16 * count <= n <= 4096 and count <= 32
     rows = scores.numel() // n
     g = n // (16 * count)
     tops = torch.empty((*scores.shape[:-1], count), device=scores.device, dtype=scores.dtype)
@@ -135,32 +117,3 @@ def window_topk_pruned(scores: torch.Tensor, count: int) -> tuple[torch.Tensor, 
     _window_topk_pruned_kernel[(rows,)](scores.contiguous(), tops, indices, N=n, K=count,
       LOG_N=n.bit_length() - 1, G=g, num_warps=1)
     return tops, indices
-
-
-@window_topk_pruned.register_fake
-def _(scores, count):
-    shape = (*scores.shape[:-1], count)
-    return (torch.empty(shape, device=scores.device, dtype=scores.dtype),
-      torch.empty(shape, device=scores.device, dtype=torch.int64))
-
-
-@torch.library.custom_op('visit_kernel::window_topk', mutates_args=())
-def window_topk(scores: torch.Tensor, count: int) -> tuple[torch.Tensor, torch.Tensor]:
-    """scores.topk(count, dim=-1) (values, indices) exactly; the kernel for bf16 rows of N = 2^m <= 4096 and
-    count <= 32, else torch.topk."""
-    n = scores.shape[-1]
-    if scores.dtype != torch.bfloat16 or n & (n - 1) or n > 4096 or count > 32:
-        return scores.topk(count, dim=-1)
-    rows = scores.numel() // n
-    tops = torch.empty((*scores.shape[:-1], count), device=scores.device, dtype=scores.dtype)
-    indices = torch.empty((*scores.shape[:-1], count), device=scores.device, dtype=torch.int64)
-    _window_topk_torch_kernel[(rows,)](scores.contiguous(), tops, indices, N=n, K=count, LOG_N=n.bit_length() - 1,
-      num_warps=1)
-    return tops, indices
-
-
-@window_topk.register_fake
-def _(scores, count):
-    shape = (*scores.shape[:-1], count)
-    return (torch.empty(shape, device=scores.device, dtype=scores.dtype),
-      torch.empty(shape, device=scores.device, dtype=torch.int64))
