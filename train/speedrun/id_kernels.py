@@ -1,8 +1,8 @@
-"""Identity-phase kernels (round 18): fused pieces of run.py's identity_grad.
+"""Identity-phase kernels: fused pieces of the identity step (identity_grad).
 
-hidden_credits_fused: hidden_credits' batched GEMM (credb @ w_out_t, bf16 out) with hidden_slope_'s relu^2 central
+hidden_credits_fused: the hidden credits' batched GEMM (credb @ w_out_t, bf16 out) with the relu^2 central
 difference slope as the GEMM epilogue: the bf16 product is rounded as cuBLAS rounds it, then scaled by the slope in
-fp32 and rounded again, so the result is hidden_credits' up to the GEMM's fp32 accumulation order.
+fp32 and rounded again.
 """
 import torch
 import triton
@@ -86,12 +86,13 @@ SQUARE_CONFIG = dict(BM=128, BN=128, BK=64, num_warps=8, num_stages=3)
 
 @triton.jit(do_not_specialize=['A1', 'A2', 'A3', 'A4', 'A5', 'A6', 'A7'])
 def _square_credit_kernel(A, A1, A2, A3, A4, A5, A6, A7, G, Out, L: tl.constexpr, M: tl.constexpr, D: tl.constexpr,
-                          HD: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
+                          HD: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
+                          FIRST: tl.constexpr = 0):
     """Out[j * L + l] = bf16(A_l^T @ B_jl) for A_l (M, D) bf16 at offset A_l from A (see _layer_offset) and
     B_jl[tok, w * HD + d] = G[w, l, j, tok, d]
-    (G (W, L, 3, M, HD) bf16, the received heads_out): identity_grad's c_q / c_k / c_v gradients without credit_stacks'
-    by-token copy."""
-    pid, jl = tl.program_id(0), tl.program_id(1)
+    (G (W, L, 3, M, HD) bf16, this GPU's head credits): identity_grad's c_q / c_k / c_v gradients, without a by-token
+    copy."""
+    pid, jl = tl.program_id(0), tl.program_id(1) + FIRST
     j, layer = jl // L, jl % L
     tiles_n = (D // HD * HD) // BN
     pm, pn = pid // tiles_n, pid % tiles_n
@@ -110,7 +111,7 @@ def _square_credit_kernel(A, A1, A2, A3, A4, A5, A6, A7, G, Out, L: tl.constexpr
     tl.store(out, acc.to(tl.bfloat16))
 
 
-def square_credit_grads(n1s, got2, out, config=None):
+def square_credit_grads(n1s, got2, out, config=None, frozen_queries=0):
     """out (3L, D, W * HD) bf16 contiguous view: out[j * L + l] = n1s[l]^T @ (got2[:, l, j] by token); n1s: eight
     (M, D) bf16 matrices (a stack or separate tensors)."""
     c = config or SQUARE_CONFIG
@@ -118,10 +119,13 @@ def square_credit_grads(n1s, got2, out, config=None):
     world, _, three, _, hd = got2.shape
     assert three == 3 and world * hd == d and out.shape == (3 * layers, d, d) and out.is_contiguous()
     assert got2.is_contiguous() and m % c['BK'] == 0 and d % c['BM'] == 0
-    grid = ((d // c['BM']) * (d // c['BN']), 3 * layers)
+    assert 0 <= frozen_queries <= layers
+    if frozen_queries:
+        out[:frozen_queries].zero_()
+    grid = ((d // c['BM']) * (d // c['BN']), 3 * layers - frozen_queries)
     _square_credit_kernel[grid](n1s[0], *layer_offsets(list(n1s)), got2, out, L=layers, M=m, D=d, HD=hd,
                                 BM=c['BM'], BN=c['BN'], BK=c['BK'], num_warps=c['num_warps'],
-                                num_stages=c['num_stages'])
+                                num_stages=c['num_stages'], FIRST=frozen_queries)
 
 
 

@@ -1,11 +1,8 @@
-"""Gluon (Hopper) factored query replay: the replay's moved queries from the root's routed change against each
-token's Wo[routes] @ W_q^T factors, the K = 64 GEMM on wgmma and several CTAs per SM to hide the replay epilogue.
+"""Factored query replay with one token/head-pair per CTA.
 
-A CTA (one warpgroup) takes BM = 64 moves x one head pair for TOK consecutive tokens: per token the change tile
-(BM x 64) and the token's transposed factor slice A_t^T (2 D x 64, w_q's rows interleaved per head so each RoPE pair
-sits in one thread) come in by TMA (two stages), raw = scale * (change @ A_t + step * F) with F's tile kept in shared
-memory for all the CTA's tokens, then query_gluon's replay epilogue (both heads' key scores in one wgmma against a
-block-diagonal key matrix). ~72 KB of shared memory: three CTAs per SM.
+Each CTA gathers its token's factors directly from the small weight product once,
+keeps them and the rotated keys resident, and iterates over all probe tiles.
+Probe-specific changes and frame tiles arrive by TMA.
 """
 import torch
 import triton
@@ -16,47 +13,29 @@ from triton.experimental.gluon.language.nvidia.hopper import (
     async_copy as cp, fence_async_shared, mbarrier, tma, warpgroup_mma, warpgroup_mma_wait)
 from triton.experimental.gluon.nvidia.hopper import TensorDescriptor
 
-from query_gluon import EPS, interleave_wq
+EPS = torch.finfo(torch.float32).eps
 from visit_chain import _bf16, _rbf16
 
 
 @gluon.jit
-def _issue(change_desc, at_desc, bar, csm, asm, s, token, pair, pos0, P: gl.constexpr, C: gl.constexpr,
-    R: gl.constexpr, BM: gl.constexpr, WN: gl.constexpr):
-    """The token's change tile and its A_t^T slice for the head pair into stage s."""
-    mbarrier.expect(bar.index(s), (BM + WN) * R * 2)
-    tma.async_copy_global_to_shared(change_desc, [token * P + pos0, 0], bar.index(s), csm.index(s))
-    tma.async_copy_global_to_shared(at_desc, [token * C + pair * WN, 0], bar.index(s), asm.index(s))
-
-
-@gluon.jit
-def _head_keys_issue(kh, kl, rh, rl, kt, k_off, r_off, rmask, K: gl.constexpr, D: gl.constexpr,
-    LO: gl.constexpr = True):
-    """cp.async of a token's rotated keys / r0' (KR rows at kt) for both heads of the pair: kh / kl rows 16 h + key,
-    rh / rl row 8 h (the other rows stay zero)."""
+def _head_keys_issue(kh, rh, kt, k_off, r_off, rmask):
+    """cp.async of a token's rotated keys / r0' (KR rows at kt) for both heads of the pair: kh rows 16 h + key, rh
+    row 8 h (the other rows stay zero)."""
     cp.async_copy_global_to_shared(kh, kt + k_off)
-    if LO:
-        cp.async_copy_global_to_shared(kl, kt + K * D + k_off)
     cp.async_copy_global_to_shared(rh, kt + r_off, mask=rmask)
-    if LO:
-        cp.async_copy_global_to_shared(rl, kt + D + r_off, mask=rmask)
     cp.commit_group()
 
 
 @gluon.jit
-def _head_scores(a, kh, kl, rh, rl, h: gl.constexpr, K: gl.constexpr, BM: gl.constexpr, mmak: gl.constexpr,
-    mmad: gl.constexpr, LO: gl.constexpr = True):
-    """Head h's raw . k' (hi + lo parts accumulated) and raw . r0' (column 0) wgmmas, in flight."""
+def _head_scores(a, kh, rh, h: gl.constexpr, K: gl.constexpr, BM: gl.constexpr, mmak: gl.constexpr,
+    mmad: gl.constexpr):
+    """Head h's raw . k' and raw . r0' (column 0) wgmmas, in flight."""
     ak = gl.convert_layout(a, gl.DotOperandLayout(operand_index=0, parent=mmak, k_width=2))
     ad = gl.convert_layout(a, gl.DotOperandLayout(operand_index=0, parent=mmad, k_width=2))
     sc = warpgroup_mma(ak, kh.slice(h * K, K).permute((1, 0)), gl.zeros([BM, K], gl.float32, mmak), use_acc=False,
       is_async=True)
-    if LO:
-        sc = warpgroup_mma(ak, kl.slice(h * K, K).permute((1, 0)), sc, is_async=True)
     q = warpgroup_mma(ad, rh.slice(h * 8, 8).permute((1, 0)), gl.zeros([BM, 8], gl.float32, mmad), use_acc=False,
       is_async=True)
-    if LO:
-        q = warpgroup_mma(ad, rl.slice(h * 8, 8).permute((1, 0)), q, is_async=True)
     return sc, q, ak, ad
 
 
@@ -76,39 +55,41 @@ def _head_weights(sc, q, moved, g, shift0, sq, rk, prob, optr, D: gl.constexpr, 
 
 
 @gluon.jit
-def _qf_rot_kernel(change_desc, at_desc, F, Steps, Scale, KR, RK, SQ, Inv, Shift, Prob, Out, N,
+def _issue_moves(change_desc, frame_desc, bar, csm, fsm, token, pair, pos0,
+    P: gl.constexpr, R: gl.constexpr, BM: gl.constexpr, WN: gl.constexpr):
+    mbarrier.expect(bar, BM * (R + WN) * 2)
+    tma.async_copy_global_to_shared(change_desc, [token * P + pos0, 0], bar, csm)
+    tma.async_copy_global_to_shared(frame_desc, [pos0, pair * WN], bar, fsm)
+
+
+@gluon.jit
+def _qf_rot_kernel(change_desc, Prod, Routes, frame_desc, Steps, Scale, KR, RK, SQ, Inv, Shift, Prob, Out,
     P: gl.constexpr, C: gl.constexpr, H: gl.constexpr, D: gl.constexpr, K: gl.constexpr, R: gl.constexpr,
-    BM: gl.constexpr, TOK: gl.constexpr, EPS_: gl.constexpr, num_warps: gl.constexpr, LO: gl.constexpr = True):
-    """_qf_kernel's tiles with the scores against rotated keys: with x = rope(raw), q = x g + shift0 r0 and
-    dq = q inv + r0 shift, a key's score is dq . k = g inv (raw . k') + (shift0 inv + shift) (r0 . k), k' the key
-    rotated back (rope is orthogonal), and q's norm sums follow from raw . r0', |raw|^2 and |r0|^2. The per-element
-    RoPE, scaling and norm sums give way to small wgmmas of each head's bf16 raw queries (split per head in
-    registers) against its rotated keys and r0' (_rot_keys_kernel's KR rows: K hi, K lo, r0' hi, r0' lo; bf16 hi /
-    lo parts, by cp.async); dq is not rounded to bf16. The next token's change / A_t^T (TMA) and keys (cp.async)
-    load under this one's epilogue. 53 KB of shared memory, 128 registers: four CTAs per SM."""
+    BM: gl.constexpr, EPS_: gl.constexpr, num_warps: gl.constexpr):
     HP: gl.constexpr = H // 2
-    MT: gl.constexpr = P // BM
     WN: gl.constexpr = 2 * D
     KR_ROWS: gl.constexpr = 2 * K + 2
     gl.static_assert(BM == 16 * num_warps)
     pid = gl.program_id(0)
     pair = pid % HP
-    pos0 = ((pid // HP) % MT) * BM
-    t0 = (pid // (HP * MT)) * TOK
-    t1 = gl.minimum(t0 + TOK, N)
-
-    csm = gl.allocate_shared_memory(gl.bfloat16, [1, BM, R], change_desc.layout)
-    asm = gl.allocate_shared_memory(gl.bfloat16, [1, WN, R], at_desc.layout)
+    token = pid // HP
+    csm = gl.allocate_shared_memory(gl.bfloat16, [BM, R], change_desc.layout)
+    asm = gl.allocate_shared_memory(gl.bfloat16, [R, WN],
+      gl.NVMMASharedLayout.get_default_for([R, WN], gl.bfloat16))
+    fsm = gl.allocate_shared_memory(gl.bfloat16, [BM, WN], frame_desc.layout)
     klay: gl.constexpr = gl.NVMMASharedLayout.get_default_for([2 * K, D], gl.bfloat16)
     rlay: gl.constexpr = gl.NVMMASharedLayout.get_default_for([16, D], gl.bfloat16)
     kh = gl.allocate_shared_memory(gl.bfloat16, [2 * K, D], klay)
-    kl = gl.allocate_shared_memory(gl.bfloat16, [2 * K, D], klay)
     rh = gl.allocate_shared_memory(gl.bfloat16, [16, D], rlay)
-    rl = gl.allocate_shared_memory(gl.bfloat16, [16, D], rlay)
-    fsm = gl.allocate_shared_memory(gl.bfloat16, [BM, WN], gl.NVMMASharedLayout.get_default_for([BM, WN], gl.bfloat16))
-    bar = gl.allocate_shared_memory(gl.int64, [1, 1], mbarrier.MBarrierLayout())
-    mbarrier.init(bar.index(0), count=1)
-    _issue(change_desc, at_desc, bar, csm, asm, 0, t0, pair, pos0, P, C, R, BM, WN)
+    bars = gl.allocate_shared_memory(gl.int64, [1, 1], mbarrier.MBarrierLayout())
+    mbarrier.init(bars.index(0), count=1)
+    factor_layout: gl.constexpr = gl.BlockedLayout([1, 8], [4, 8], [num_warps, 1], [1, 0])
+    factor_r = gl.arange(0, R, gl.SliceLayout(1, factor_layout))
+    factor_c = gl.arange(0, WN, gl.SliceLayout(0, factor_layout))
+    chosen = gl.load(Routes + token * R + factor_r).to(gl.int64)
+    cp.async_copy_global_to_shared(asm, Prod + chosen[:, None] * C + (pair * WN + factor_c)[None, :])
+    cp.commit_group()
+    _issue_moves(change_desc, frame_desc, bars.index(0), csm, fsm, token, pair, 0, P, R, BM, WN)
 
     mma: gl.constexpr = gl.NVMMADistributedLayout(version=[3, 0], warps_per_cta=[num_warps, 1],
       instr_shape=[16, WN, 16])
@@ -125,57 +106,47 @@ def _qf_rot_kernel(change_desc, at_desc, F, Steps, Scale, KR, RK, SQ, Inv, Shift
     rr = gl.arange(0, 16, gl.SliceLayout(1, bl))
     r_off = ((2 * pair + rr // 8) * KR_ROWS + 2 * K)[:, None] * D + kc[None, :]
     rmask = (rr % 8 == 0)[:, None] & (kc < D)[None, :]
-    rh.store(gl.zeros([16, D], gl.bfloat16, bl))  # rows 8 h + 1.. stay zero
-    rl.store(gl.zeros([16, D], gl.bfloat16, bl))
+    rh.store(gl.zeros([16, D], gl.bfloat16, bl))
     gl.thread_barrier()
-    _head_keys_issue(kh, kl, rh, rl, KR + t0 * (H * KR_ROWS * D), k_off, r_off, rmask, K, D, LO)
-    fr = gl.arange(0, BM, gl.SliceLayout(1, bl))
-    fc = gl.arange(0, WN, gl.SliceLayout(0, bl))
-    fsm.store(gl.load(F + (pos0 + fr)[:, None] * C + (pair * WN + fc)[None, :]))
+    _head_keys_issue(kh, rh, KR + token * (H * KR_ROWS * D), k_off, r_off, rmask)
     scale = gl.load(Scale).to(gl.float32)
+    step = gl.load(Steps + token)
     zero = gl.zeros([BM, WN], gl.float32, mma)
     rows = gl.arange(0, BM, RL)
     kk = gl.arange(0, K, KLY)
-
-    for token in range(t0, t1):
-        ti = token - t0
-        step = gl.load(Steps + token)
-        cp.wait_group(0)
-        fence_async_shared()
-        gl.thread_barrier()  # the token's keys (and F's tile) in every warp's view
-        mbarrier.wait(bar.index(0), ti & 1)
-        acc = warpgroup_mma(csm.index(0), asm.index(0).permute((1, 0)), zero, use_acc=False, is_async=True)
+    hk = (token * H + 2 * pair) * K + kk
+    rk0 = gl.load(RK + hk)
+    rk1 = gl.load(RK + K + hk)
+    pr0 = gl.load(Prob + hk)
+    pr1 = gl.load(Prob + K + hk)
+    sq0 = gl.load(SQ + token * H + 2 * pair)
+    sq1 = gl.load(SQ + token * H + 2 * pair + 1)
+    cp.wait_group(0)
+    fence_async_shared()
+    gl.thread_barrier()
+    for pos0 in range(0, P, BM):
+        mbarrier.wait(bars.index(0), (pos0 // BM) & 1)
+        acc = warpgroup_mma(csm, asm, zero, use_acc=False, is_async=True)
         acc = warpgroup_mma_wait(0, deps=[acc])
-        gl.thread_barrier()  # every warp is done with the change / A_t^T tiles
-        if token + 1 < t1:
-            _issue(change_desc, at_desc, bar, csm, asm, 0, token + 1, pair, pos0, P, C, R, BM, WN)
         raw = scale * (acc + step * fsm.load(mma).to(gl.float32))
-        x0, x1 = gl.split(gl.permute(gl.reshape(_bf16(raw), [BM, 2, D]), (0, 2, 1)))  # per head
-        s0, q0, a0, d0 = _head_scores(x0, kh, kl, rh, rl, 0, K, BM, mmak, mmad, LO)
-        s1, q1, a1, d1 = _head_scores(x1, kh, kl, rh, rl, 1, K, BM, mmak, mmad, LO)
+        gl.thread_barrier()
+        if pos0 + BM < P:
+            _issue_moves(change_desc, frame_desc, bars.index(0), csm, fsm, token, pair, pos0 + BM, P, R, BM, WN)
+        x0, x1 = gl.split(gl.permute(gl.reshape(_bf16(raw), [BM, 2, D]), (0, 2, 1)))
+        s0, q0, a0, d0 = _head_scores(x0, kh, rh, 0, K, BM, mmak, mmad)
+        s1, q1, a1, d1 = _head_scores(x1, kh, rh, 1, K, BM, mmak, mmad)
         prow = token * P + pos0 + rows
         g = gl.load(Inv + prow)
         shift0 = gl.load(Shift + prow)
-        hk = (token * H + 2 * pair) * K + kk
-        rk0 = gl.load(RK + hk)
-        rk1 = gl.load(RK + K + hk)
-        pr0 = gl.load(Prob + hk)
-        pr1 = gl.load(Prob + K + hk)
-        sq0 = gl.load(SQ + token * H + 2 * pair)
-        sq1 = gl.load(SQ + token * H + 2 * pair + 1)
         f0 = x0.to(gl.float32)
         f1 = x1.to(gl.float32)
-        m0 = gl.convert_layout(gl.sum(f0 * f0, 1), RL)  # |raw|^2 per (move, head) = |rope(raw)|^2
+        m0 = gl.convert_layout(gl.sum(f0 * f0, 1), RL)
         m1 = gl.convert_layout(gl.sum(f1 * f1, 1), RL)
         s0, q0, s1, q1 = warpgroup_mma_wait(0, deps=[s0, q0, s1, q1, a0, d0, a1, d1])[:4]
-        gl.thread_barrier()  # every warp is done with the keys
-        if token + 1 < t1:
-            _head_keys_issue(kh, kl, rh, rl, KR + (token + 1) * (H * KR_ROWS * D), k_off, r_off, rmask, K, D, LO)
         orow = gl.expand_dims(prow.to(gl.int64) * (H * K), 1) + (2 * pair * K + kk)[None, :]
         _head_weights(s0, q0, m0, g, shift0, sq0, rk0, pr0, Out + orow, D, EPS_)
         _head_weights(s1, q1, m1, g, shift0, sq1, rk1, pr1, Out + orow + K, D, EPS_)
-    mbarrier.invalidate(bar.index(0))
-
+    mbarrier.invalidate(bars.index(0))
 
 @triton.jit
 def _rot_keys_kernel(Keys, R0, Cos, Sin, KR, RK, SQ, H: tl.constexpr, K: tl.constexpr, D: tl.constexpr):
@@ -208,15 +179,14 @@ def _rot_keys_kernel(Keys, R0, Cos, Sin, KR, RK, SQ, H: tl.constexpr, K: tl.cons
     tl.store(out + (2 * K + 1) * D + dd, (up - uhi.to(tl.float32)).to(tl.bfloat16))
 
 
-ROT_CONFIG = dict(BM=64, TOK=8, num_warps=4, maxnreg=128, LO=True)  # no spills at 128; LO False (the record): the
-# rotated keys' / r0's bf16 high parts only (not bitwise)
+ROT_CONFIG = dict(BM=64, num_warps=4, maxnreg=128)  # no spills at 128
 
 
 @triton.jit
 def _factor_at_kernel(Wo, Routes, Wq, At, M, C: tl.constexpr, D: tl.constexpr, R: tl.constexpr, BM: tl.constexpr,
     BN: tl.constexpr, BK: tl.constexpr):
     """At[t, c, r] = (w_q @ Wo[routes[t, r]]^T)[c] (bf16, fp32 accumulation): the gathered rows' GEMM, stored
-    transposed per token (r contiguous)."""
+    transposed per token (r contiguous). Called with every hidden unit as its own row (R = 1): the full product."""
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
     rows = pid_m * BM + tl.arange(0, BM)
@@ -234,25 +204,19 @@ def _factor_at_kernel(Wo, Routes, Wq, At, M, C: tl.constexpr, D: tl.constexpr, R
     tl.store(At + dst, acc.to(tl.bfloat16), mask=live[:, None])
 
 
+def interleave_wq(w_q, heads):
+    """w_q's rows per head reordered a0 b0 a1 b1 ... (the RoPE halves interleaved), bf16."""
+    c = w_q.shape[0]
+    return w_q.to(torch.bfloat16).view(heads, 2, c // heads // 2, -1).transpose(1, 2).reshape(c, -1).contiguous()
+
+
 FACTOR_CONFIG = dict(BM=128, BN=256, BK=64, num_warps=8, num_stages=3)
 
 
-@triton.jit
-def _gather_at_kernel(Prod, Routes, At, C: tl.constexpr, R: tl.constexpr, BC: tl.constexpr):
-    """At[t, c, r] = Prod[routes[t, r], c]: token t's rows of the full product, stored transposed (r contiguous)."""
-    token = tl.program_id(0).to(tl.int64)
-    cols = tl.program_id(1) * BC + tl.arange(0, BC)
-    rr = tl.arange(0, R)
-    chosen = tl.load(Routes + token * R + rr).to(tl.int64)
-    tile = tl.load(Prod + chosen[:, None] * C + cols[None, :])
-    tl.store(At + (token * C + cols[None, :]) * R + rr[:, None], tile)
-
-
-@torch.library.custom_op('visit_kernel::query_factors_t_gathered', mutates_args=())
-def query_factors_t_gathered(wo: torch.Tensor, routes: torch.Tensor, basis: torch.Tensor,
+@torch.library.custom_op('visit_kernel::query_factors_table', mutates_args=())
+def query_factors_table(wo: torch.Tensor, routes: torch.Tensor, basis: torch.Tensor,
     w_q: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """query_factors_t with At gathered from the full product Wo @ w_q^T (every hidden row once, by
-    _factor_at_kernel's own tiles and accumulation order, so bitwise) instead of one GEMM row per routed row."""
+    """Full bf16 factor product and frame projection; routed rows are gathered inside the replay."""
     c = w_q.shape[0]
     wq = interleave_wq(w_q, c // 64)
     n, r = routes.shape
@@ -263,30 +227,29 @@ def query_factors_t_gathered(wo: torch.Tensor, routes: torch.Tensor, basis: torc
     every = torch.arange(rows, device=wo.device, dtype=routes.dtype)
     _factor_at_kernel[(triton.cdiv(rows, cfg['BM']), c // cfg['BN'])](wo.contiguous(), every, wq, prod, rows, c, d, 1,
       **cfg)
-    at = torch.empty((n, c, r), device=wo.device, dtype=torch.bfloat16)
-    _gather_at_kernel[(n, c // 64)](prod, routes.contiguous(), at, c, r, BC=64, num_warps=4)
     f = (basis.float() @ wq.float().T).to(torch.bfloat16)
-    return at, f
+    return prod.view(rows, c), f
 
 
-@query_factors_t_gathered.register_fake
+@query_factors_table.register_fake
 def _(wo, routes, basis, w_q):
-    return (torch.empty((routes.shape[0], w_q.shape[0], routes.shape[1]), device=wo.device, dtype=torch.bfloat16),
+    return (torch.empty((wo.shape[0], w_q.shape[0]), device=wo.device, dtype=torch.bfloat16),
       torch.empty((basis.shape[0], w_q.shape[0]), device=wo.device, dtype=torch.bfloat16))
 
 
 @torch.library.custom_op('visit_kernel::fused_query_replay_factored_rot', mutates_args=())
 def fused_query_replay_factored_rot(change: torch.Tensor, steps: torch.Tensor, scale: torch.Tensor,
     at: torch.Tensor, f: torch.Tensor, r0: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, inv: torch.Tensor,
-    shift: torch.Tensor, keys: torch.Tensor, prob: torch.Tensor) -> torch.Tensor:
-    """fused_query_replay_factored_gluon's API by _qf_rot_kernel (the scores against rotated keys, no per-element
+    shift: torch.Tensor, keys: torch.Tensor, prob: torch.Tensor, routes: torch.Tensor) -> torch.Tensor:
+    """The factored query replay by _qf_rot_kernel (the scores against rotated keys, no per-element
     RoPE; dq unrounded, one reciprocal per row): one _rot_keys_kernel pass over the keys, then the replay."""
     n, p, r = change.shape
     _, heads, count, width = keys.shape
     c = heads * width
     cfg = dict(ROT_CONFIG)
-    bm, tok = cfg.pop('BM'), cfg.pop('TOK')
-    assert p % bm == 0 and width == 64 and heads % 2 == 0 and at.shape == (n, c, r) and f.shape == (p, c)
+    bm = cfg.pop('BM')
+    assert p % bm == 0 and width == 64 and heads % 2 == 0 and at.ndim == 2 and at.shape[1] == c and routes.shape == (n,
+        r) and f.shape == (p, c)
     f32 = lambda z: z.float().contiguous()
     kr = torch.empty((n, heads, 2 * count + 2, width), device=change.device, dtype=torch.bfloat16)
     rk = torch.empty((n, heads, count), device=change.device, dtype=torch.float32)
@@ -296,14 +259,15 @@ def fused_query_replay_factored_rot(change: torch.Tensor, steps: torch.Tensor, s
     out = torch.empty((n, p, heads * count), device=change.device, dtype=torch.bfloat16)
     change_desc = TensorDescriptor.from_tensor(change.contiguous().view(n * p, r), [bm, r],
       gl.NVMMASharedLayout.get_default_for([bm, r], gl.bfloat16))
-    at_desc = TensorDescriptor.from_tensor(at.contiguous().view(n * c, r), [2 * width, r],
-      gl.NVMMASharedLayout.get_default_for([2 * width, r], gl.bfloat16))
-    grid = (triton.cdiv(n, tok) * (p // bm) * (heads // 2),)
-    _qf_rot_kernel[grid](change_desc, at_desc, f.contiguous(), f32(steps), scale, kr, rk, sq, f32(inv), f32(shift),
-      f32(prob), out, n, p, c, heads, width, count, r, BM=bm, TOK=tok, EPS_=EPS, **cfg)
+    frame_desc = TensorDescriptor.from_tensor(f.contiguous(), [bm, 2 * width],
+      gl.NVMMASharedLayout.get_default_for([bm, 2 * width], gl.bfloat16))
+    grid = (n * (heads // 2),)
+    _qf_rot_kernel[grid](change_desc, at.contiguous(), routes.contiguous(), frame_desc, f32(steps), scale, kr, rk, sq,
+        f32(inv), f32(shift),
+      f32(prob), out, p, c, heads, width, count, r, BM=bm, EPS_=EPS, **cfg)
     return out
 
 
 @fused_query_replay_factored_rot.register_fake
-def _(change, steps, scale, at, f, r0, cos, sin, inv, shift, keys, prob):
+def _(change, steps, scale, at, f, r0, cos, sin, inv, shift, keys, prob, routes):
     return torch.empty((*change.shape[:2], keys.shape[1] * keys.shape[2]), device=change.device, dtype=torch.bfloat16)
