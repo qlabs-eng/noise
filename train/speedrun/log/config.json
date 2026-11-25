@@ -12,41 +12,38 @@
       "n_embd": 512,
       "window_pattern": "SSSL"
     },
+    "batch_history_sign": -1,
+    "average_knots": 48,
     "late_cut_decay_multiplier": 0.0,
     "cut_batch": 8,
     "wide_rows": 16,
     "wide_from": 0.0,
-    "wide_lr_scale": 1.3,
-    "wide_anvil_scale": 1.3,
+    "wide_lr_scale": 1.2,
+    "wide_anvil_scale": 1.2,
     "lr": 0.0028,
     "betas": [
-      0.5,
+      0.4,
       0.98
     ],
     "warmdown": 0.55,
-    "final": 0.5,
+    "final": 0.35,
     "anvil_lr": 0.036,
     "anvil_wd": 2.25,
     "fast_weight": 1.0,
     "polar_margin": 1.1,
-    "telemetry_batch": 1024,
     "fc_sigma": 0.05,
     "route_k_late": 64,
-    "route_split": 2,
     "query_moment_sigma": 0.003,
-    "query_sample_keep": 24,
+    "depth_query_low": 20,
+    "depth_query_high": 28,
+    "depth_query_panel": 1024,
     "query_sample_group": 64,
-    "chain_sigma": 0.01,
+    "chain_sigma": 0.014,
     "chain_depth_roots": [
       4,
       6
     ],
-    "chain_token_fraction": [
-      0.375,
-      1.0
-    ],
-    "chain_pps_floor": 0.4,
-    "chain_carry": true,
+    "chain_pps_floor": 0.25,
     "joint_root_groups": [
       [
         4
@@ -55,23 +52,21 @@
         6
       ]
     ],
-    "route_k": 128,
     "chain_tokens": 2048,
     "query_replay_long_layers": [
       5
     ],
     "gate_path_sigma": 0.01,
     "query_keys": 16,
-    "key_sigma": 0.003,
-    "emb_scale": 750.0,
+    "key_sigma": 0.0045,
+    "emb_scale": 600.0,
     "lambda_scale": 15.0,
     "resid_rate_gain": 0.3429971702850177,
     "x0_rate_gain": 1.3719886811400708
   },
-  "steps": 1069,
-  "overrides": [],
-  "epoch_updates": 1823,
-  "train_rows": 14584,
-  "upstream": "qlabs-eng/noise@b0a8675ea3aa1cd0ccb3661b409a978d3d6e89e2",
+  "steps": 1073,
+  "epoch_updates": 1073,
+  "train_rows": 14648,
+  "upstream": "qlabs-eng/noise@de9732b9882fdc21ff9be566f6f577f37be500a1",
   "torch_version": "2.10.0+cu128"
 }
