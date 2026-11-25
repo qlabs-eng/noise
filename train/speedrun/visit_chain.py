@@ -1,4 +1,4 @@
-"""Pieces the Gluon (Hopper) chain kernels share (visit_chain3.py, factor_inline.py): the cp.async ring of routed
+"""Pieces the Gluon (Hopper) chain kernels share (visit_chain3.py, terminal_panels.py): the cp.async ring of routed
 rows, a block's gate and output chunks with the tile's delta kept in shared memory between them, the readout chunks
 and their sums, packed bf16 conversions, and the readout vectors split into bf16 parts for the tensor cores.
 """
@@ -13,7 +13,7 @@ from triton.experimental.gluon.language.nvidia.hopper import (
 EPS = torch.finfo(torch.float32).eps
 
 # _bf16 / _rbf16: packed fp32 -> bf16 conversions (cvt.rn.bf16x2.f32) where ptxas emits scalar F2F; bitwise
-# TC (root chain, chain3): dot products on the tensor cores: the gates of blocks fed from shared memory take d . x as a
+# TC (chain3): dot products on the tensor cores: the gates of blocks fed from shared memory take d . x as a
 # wgmma against x in 3 bf16 parts (8-row B tiles; x's sum of squares per token from the host), the readout its four
 # linear moments against xl / target / mu / nu in 2 bf16 parts (|residual| <= 2^-17); squares stay on the FMA pipes.
 # Not bitwise (fp32 order, the 2-part split).
@@ -127,16 +127,6 @@ def _rows_issue(buf, Src, token, pred, D: gl.constexpr, BK: gl.constexpr, num_wa
     cols = gl.arange(0, BK, gl.SliceLayout(0, lay))
     off = token.to(gl.int64) * 8 * D + ((rows % 8) * D + (rows // 8) * BK)[:, None] + cols[None, :]
     cp.async_copy_global_to_shared(buf, Src + off, mask=(cols < BK)[None, :] & pred)
-
-
-@gluon.jit
-def _tc_parts_issue(buf, Src, token, pred, D: gl.constexpr, BK: gl.constexpr, num_warps: gl.constexpr):
-    lay: gl.constexpr = gl.BlockedLayout([1, 8], [4, 8], [num_warps, 1], [1, 0])
-    rows = gl.arange(0, 8, gl.SliceLayout(1, lay))
-    cols = gl.arange(0, BK, gl.SliceLayout(0, lay))
-    for c in gl.static_range(D // BK):
-        off = token.to(gl.int64) * 8 * D + rows[:, None] * D + c * BK + cols[None, :]
-        cp.async_copy_global_to_shared(buf.index(c), Src + off, mask=(cols < BK)[None, :] & pred)
 
 
 @gluon.jit

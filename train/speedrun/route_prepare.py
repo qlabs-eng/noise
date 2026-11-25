@@ -12,12 +12,19 @@ def _ordered_bits(x):
 @triton.jit
 def _route_prepare_kernel(Inputs, Radius, OutNorm, Indices, Clean, Scratch, L: tl.constexpr, ROWS: tl.constexpr,
     N: tl.constexpr, K: tl.constexpr, G: tl.constexpr,
-                              CAP: tl.constexpr, SCALE: tl.constexpr):
+                              CAP: tl.constexpr, SCALE: tl.constexpr, RowIds=None, PartnerIds=None,
+                              T: tl.constexpr = 0):
     """torch.topk(scores, K).indices of one row, exactly: floor = the K-th largest of the N / G group maxima (count(key
     >= floor) >= K, so every top-K key is >= it); the candidates key >= floor, if at most CAP (else the binary search
     from the floor), compacted and top-K'd as (key, N - 1 - col) (values descending, equal values by ascending
     index)."""
     row = tl.program_id(0).to(tl.int64)
+    source_row = row
+    if PartnerIds is not None:
+        if row < ROWS // 2:
+            source_row = tl.load(RowIds + row).to(tl.int64)
+        else:
+            source_row = tl.load(PartnerIds + row - ROWS // 2).to(tl.int64) + T
     NG: tl.constexpr = N // G
     cols = tl.arange(0, NG)[:, None] * G + tl.arange(0, G)[None, :]
     layer = tl.program_id(1)
@@ -26,7 +33,7 @@ def _route_prepare_kernel(Inputs, Radius, OutNorm, Indices, Clean, Scratch, L: t
     h = tl.full((NG, G), 0, tl.float32)
     for j in tl.static_range(L):
         if layer == j:
-            h = tl.load(Inputs[j] + row * N + cols).to(tl.float32)
+            h = tl.load(Inputs[j] + source_row * N + cols).to(tl.float32)
     up = tl.maximum(h + radius, 0)
     down = tl.maximum(h - radius, 0)
     score = tl.abs(up * up - down * down) * out_norm
@@ -66,26 +73,26 @@ def _route_prepare_kernel(Inputs, Radius, OutNorm, Indices, Clean, Scratch, L: t
     index = (N - 1 - (top & 0xFFFFFFFF)).to(tl.int32)
     tl.store(Indices + row * K + tl.arange(0, K), index)
     selected = tl.full((K,), 0, tl.float32)
-    local_row = row % ROWS
     for j in tl.static_range(L):
         if layer == j:
-            selected = tl.load(Inputs[j] + local_row * N + index).to(tl.float32)
+            selected = tl.load(Inputs[j] + source_row * N + index).to(tl.float32)
     tl.store(Clean + row * K + tl.arange(0, K), selected)
 
 
 def prepare(inputs: list[torch.Tensor], radius: torch.Tensor, out_norm: torch.Tensor,
-            count: int, fuse: bool = True, groups: int = 0, cap_multiple: int = 2, warps: int = 1,
-            scale: float = 1.0) -> tuple[torch.Tensor, torch.Tensor]:
+            count: int, scale: float, row_ids=None, partner_ids=None,
+            row_length=0) -> tuple[torch.Tensor, torch.Tensor]:
     n = inputs[0].shape[-1]
     rows = inputs[0].numel() // n
-    assert all(x.is_contiguous() and x.shape[-1] == n and x.numel() == rows*n for x in inputs)
+    if partner_ids is not None:
+        rows = 2 * row_ids.numel()
     layers = len(inputs)
     indices = torch.empty((layers, rows, count), device=radius.device, dtype=torch.int64)
     clean = torch.empty((layers, rows, count), device=radius.device, dtype=torch.float32)
-    cap = cap_multiple * count
-    groups = groups or min(4 * count, n)
+    cap = 2 * count
+    groups = min(4 * count, n)
     scratch = torch.empty((layers, rows, cap), device=radius.device, dtype=torch.int64)
     _route_prepare_kernel[(rows, layers)](tuple(inputs), radius.contiguous(), out_norm.contiguous(),
         indices, clean, scratch, L=layers, ROWS=rows, N=n, K=count, G=n//groups,
-        CAP=cap, SCALE=scale, num_warps=warps, enable_fp_fusion=fuse)
+        CAP=cap, SCALE=scale, RowIds=row_ids, PartnerIds=partner_ids, T=row_length, num_warps=1, enable_fp_fusion=True)
     return indices, clean
