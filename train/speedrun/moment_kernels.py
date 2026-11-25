@@ -1,11 +1,4 @@
-"""Query-moment and identity key-moment kernels (from #56's moment_kernels.py).
-
-- _pair_operands, _by_token and _query_response: the per-token operands and the degree-2 softmax moment response
-  that the sampled query credits (query_sampling.py) share with the identity phase.
-- _moment_query_scores: the identity phase's query credits (every token).
-- moment_key_scores: the identity phase's key credits and value sums.
-"""
-import torch
+"""Softmax moment responses for the Identity phase and the sampled Cut queries."""
 import triton
 import triton.language as tl
 from triton.language.extra import libdevice
@@ -15,42 +8,12 @@ IMPLICIT_CONFIG = dict(BM=64, BN=64, num_warps=4, num_stages=2)
 MOMENT_CONFIG = dict(PAIRS=16, BLOCK_T=32, BLOCK_S=64, num_warps=4, num_stages=3)
 
 
-# --- per-token operands ------------------------------------------------------------------------------------------
+# --- by-token output offsets -------------------------------------------------------------------------------------
 
 @triton.jit
-def _pair_features(X, F2, F4, XY, T: tl.constexpr, D: tl.constexpr, BLOCK: tl.constexpr):
-    """The query moments' bf16 dot operands of each key of X (rows, T, D), from its pairs' scaled coordinates
-    x = X[i] / sqrt(D), y = X[i + D / 2], pair-major: F2 = (x, y), F4 = (x, x^2, y, y^2) and XY = x y."""
-    J: tl.constexpr = D // 2
-    row, tile = tl.program_id(0), tl.program_id(1)
-    token = row.to(tl.int64) * T + tile * BLOCK + tl.arange(0, BLOCK)
-    pairs = tl.arange(0, J)
-    dims = tl.arange(0, D)
-    x = tl.load(X + token[:, None] * D + pairs[None, :]) * D ** (-0.5)
-    y = tl.load(X + token[:, None] * D + (pairs + J)[None, :]) * D ** (-0.5)
-    tl.store(F2 + token[:, None] * D + dims[None, :], tl.reshape(tl.join(x, y), (BLOCK, D)).to(tl.bfloat16))
-    tl.store(XY + token[:, None] * J + pairs[None, :], (x * y).to(tl.bfloat16))
-    f4 = tl.reshape(tl.join(tl.join(x, y), tl.join(x * x, y * y)), (BLOCK, 2 * D))
-    tl.store(F4 + token[:, None] * (2 * D) + tl.arange(0, 2 * D)[None, :], f4.to(tl.bfloat16))
-
-
-def _pair_operands(x):
-    rows, t, d = x.shape
-    f2 = x.new_empty((rows, t, d), dtype=torch.bfloat16)
-    f4 = x.new_empty((rows, t, 2 * d), dtype=torch.bfloat16)
-    xy = x.new_empty((rows, t, d // 2), dtype=torch.bfloat16)
-    _pair_features[rows, t // 64](x, f2, f4, xy, T=t, D=d, BLOCK=64, num_warps=4)
-    return f2, f4, xy
-
-
-@triton.jit
-def _by_token(row, H: tl.constexpr, LAYER, TOKEN, C: tl.constexpr, Map=None, MAPPED: tl.constexpr = False):
-    """Offset of row's token 0 when the rows (head h of layer l = row // H) are stored by token in a
-    (layers, T, >= H * C) view with strides (LAYER, TOKEN, 1): H = 1, LAYER = T * C, TOKEN = C is the stacked
-    (rows, T, C) layout. With MAPPED, layer l is stored at index Map[l] of the view's first axis."""
-    layer = row // H
-    if MAPPED:
-        layer = tl.load(Map + layer)
+def _by_token(row, H: tl.constexpr, LAYER, C: tl.constexpr, Map):
+    """Offset of the first token for this head of the mapped Cut layer."""
+    layer = tl.load(Map + row // H)
     return layer.to(tl.int64) * LAYER + (row % H) * C
 
 
@@ -90,8 +53,10 @@ def _split4(acc, BLOCK: tl.constexpr, J: tl.constexpr):
 
 @triton.jit
 def _query_response(n4, d4, nxy, dxy, l2, m2, s1n, s2n, s1d, s2d, raw_ptr, sq_ptr, steps_ptr, cos_ptr, sin_ptr,
-    out_ptr, row, BH, T, offs_s, d, M, RAW_GPU, RAW_STRIDE, W_STRIDE, D: tl.constexpr, J: tl.constexpr,
-    BLOCK_S: tl.constexpr, OUT_H: tl.constexpr, OUT_LAYER, OUT_TOKEN, out_map, OUT_MAPPED: tl.constexpr):
+    row, BH, T, offs_s, d, M, RAW_GPU, RAW_STRIDE, D: tl.constexpr, J: tl.constexpr, BLOCK_S: tl.constexpr):
+    """The degree-2 softmax moment response to a finite step of each raw (pre-RoPE) query coordinate d through RoPE
+    and the query norm. The step moves both rotated coordinates of d's pair (bu and bw), so the model carries their
+    mixed term (nxy, dxy)."""
     ca, bu, bw = _query_coefficients(raw_ptr, sq_ptr, steps_ptr, cos_ptr, sin_ptr, row, BH, T, offs_s, d, M,
       RAW_GPU, RAW_STRIDE, D)
     nx0, ny0, nx1, ny1 = _split4(n4, BLOCK_S, J)
@@ -103,20 +68,15 @@ def _query_response(n4, d4, nxy, dxy, l2, m2, s1n, s2n, s1d, s2d, raw_ptr, sq_pt
     zd = (dx0 * bu + dy0 * bw + 0.5 * (dx1 * bu * bu + dy1 * bw * bw) + dxy * bu * bw
       + ca * (mx0 * bu + my0 * bw) + s1d[:, None] * ca + s2d[:, None] * (0.5 * ca * ca))
     steps = tl.load(steps_ptr + row * T + offs_s)
-    z = zn / (1.0 + zd) / steps[:, None]
-    if OUT_H:  # fp32 by token, the bf16 output's values
-        start = _by_token(row, OUT_H, OUT_LAYER, OUT_TOKEN, D, out_map, OUT_MAPPED)
-        tl.store(out_ptr + start + offs_s[:, None] * OUT_TOKEN + d[None, :], z.to(tl.bfloat16).to(tl.float32))
-    else:
-        _query_store(out_ptr, z, row, BH, T, offs_s, d, M, W_STRIDE, D)
+    return zn / (1.0 + zd) / steps[:, None]
 
 
 @triton.jit
 def _moment_queries_kernel(q_ptr, k_ptr, v_ptr, hub_ptr, raw_ptr, sq_ptr, f2_ptr, f4_ptr, xy_ptr, cos_ptr, sin_ptr,
     lse_ptr,
-    hubout_ptr, steps_ptr, out_ptr, BH, T, scale, RAW_BLK, RAW_GPU, RAW_STRIDE, M, OUT_BLK, W_STRIDE, OUT_LAYER,
-    OUT_TOKEN, out_map, D: tl.constexpr, J: tl.constexpr, BLOCK_T: tl.constexpr, BLOCK_S: tl.constexpr,
-    WINDOW: tl.constexpr, OUT_H: tl.constexpr, OUT_MAPPED: tl.constexpr):
+    hubout_ptr, steps_ptr, out_ptr, BH, T, scale, RAW_BLK, RAW_GPU, RAW_STRIDE, M, OUT_BLK, W_STRIDE,
+    D: tl.constexpr, J: tl.constexpr, BLOCK_T: tl.constexpr, BLOCK_S: tl.constexpr,
+    WINDOW: tl.constexpr):
     """The query moments: each program's J feature pairs (of D // 2) feed both raw coordinates of each pair
     (d = pair and d = pair + D // 2)."""
     parts: tl.constexpr = D // 2 // J
@@ -171,28 +131,23 @@ def _moment_queries_kernel(q_ptr, k_ptr, v_ptr, hub_ptr, raw_ptr, sq_ptr, f2_ptr
         s1d += tl.sum(a * logits, axis=1)
         s2d += tl.sum(a * logits * logits, axis=1)
     for half in tl.static_range(2):
-        _query_response(n4, d4, nxy, dxy, l2, m2, s1n, s2n, s1d, s2d, raw_ptr, sq_ptr, steps_ptr, cos_ptr, sin_ptr,
-          out_ptr, row, BH, T, offs_s, pairs + half * (D // 2), M, RAW_GPU, RAW_STRIDE, W_STRIDE, D, J, BLOCK_S,
-          OUT_H, OUT_LAYER, OUT_TOKEN, out_map, OUT_MAPPED)
+        d = pairs + half * (D // 2)
+        z = _query_response(n4, d4, nxy, dxy, l2, m2, s1n, s2n, s1d, s2d, raw_ptr, sq_ptr, steps_ptr, cos_ptr, sin_ptr,
+          row, BH, T, offs_s, d, M, RAW_GPU, RAW_STRIDE, D, J, BLOCK_S)
+        _query_store(out_ptr, z, row, BH, T, offs_s, d, M, W_STRIDE, D)
 
 
-def _moment_query_scores(q, k, v, hub, raw, sq, side, cos, sin, lse, hub_out, steps, out, repeat, window=None,
-                         out_heads=0, layers=None, config=None, pair_ops=None):
-    """out: (1, rows, T, D) bf16, or with out_heads a (rows // out_heads, T, out_heads * D) fp32 view (last stride
-    1)."""
+def _moment_query_scores(q, k, v, hub, raw, sq, pair_ops, cos, sin, lse, hub_out, steps, out):
+    """Write the Identity phase's query response using the prepared key-pair features."""
     rows, t, d = q.shape
     blocks = raw.shape[1]
-    c = config or MOMENT_CONFIG
-    assert repeat == 4 and d == 64, 'the reference call (repeat = head_dim // 16)'
+    c = MOMENT_CONFIG
     parts = d // 2 // c['PAIRS']
-    f2, f4, xy = pair_ops if pair_ops is not None else _pair_operands(side.contiguous())
-    m, out_blk, w_stride = (t, 0, 0) if out_heads else (out.shape[2], out.stride(1), out.stride(0))
-    assert not out_heads or out.stride(2) == 1
+    f2, f4, xy = pair_ops
     _moment_queries_kernel[(rows * parts, t // c['BLOCK_S'])](q, k, v, hub, raw, sq, f2, f4, xy, cos, sin, lse, hub_out,
-      steps, out, rows // blocks, t, d ** -0.5, raw.stride(1), raw.stride(0), raw.stride(2), m, out_blk, w_stride,
-      out.stride(0), out.stride(1), out if layers is None else layers,
-      D=d, J=c['PAIRS'], BLOCK_T=c['BLOCK_T'], BLOCK_S=c['BLOCK_S'], WINDOW=t if window is None else min(window, t),
-      OUT_H=out_heads, OUT_MAPPED=layers is not None, num_warps=c['num_warps'], num_stages=c['num_stages'])
+      steps, out, rows // blocks, t, d ** -0.5, raw.stride(1), raw.stride(0), raw.stride(2), out.shape[2],
+      out.stride(1), out.stride(0), D=d, J=c['PAIRS'], BLOCK_T=c['BLOCK_T'], BLOCK_S=c['BLOCK_S'], WINDOW=t,
+      num_warps=c['num_warps'], num_stages=c['num_stages'])
 
 
 # --- identity-phase key moments -----------------------------------------------------------------------------------
@@ -200,8 +155,9 @@ def _moment_query_scores(q, k, v, hub, raw, sq, side, cos, sin, lse, hub_out, st
 @triton.jit
 def _moment_keys_kernel(q_ptr, k_ptr, v_ptr, hub_ptr, raw_ptr, sq_ptr, side_ptr, cos_ptr, sin_ptr, lse_ptr, hubout_ptr,
     steps_ptr, out_ptr, value_ptr, BH, T, scale, RAW_BLK, RAW_GPU, RAW_STRIDE, M, OUT_BLK, W_STRIDE,
-    D: tl.constexpr, BLOCK_T: tl.constexpr, BLOCK_S: tl.constexpr):
-    """The key moments (repeat = 2), one program per token tile: both output coordinates of a pair (d = pair,
+    D: tl.constexpr, BLOCK_T: tl.constexpr, BLOCK_S: tl.constexpr, SHORT_WINDOW: tl.constexpr,
+    Gates, Destinations, Lexical):
+    """The key moments, one program per token tile: both output coordinates of a pair (d = pair,
     pair + 32) come from the same moment sums (pairs i % 32), formed once; the value sum runs over all 64 hub
     columns."""
     J: tl.constexpr = D // 2
@@ -224,7 +180,9 @@ def _moment_keys_kernel(q_ptr, k_ptr, v_ptr, hub_ptr, raw_ptr, sq_ptr, side_ptr,
     val = tl.zeros((BLOCK_T, D), tl.float32)
     s1 = tl.zeros((BLOCK_T,), tl.float32)
     s2 = tl.zeros((BLOCK_T,), tl.float32)
-    for it in range(t0 // BLOCK_S, T // BLOCK_S):
+    window = tl.where(blk % 4 == 3, T, SHORT_WINDOW)
+    last = tl.cdiv(tl.minimum(T, t0 + BLOCK_T + window), BLOCK_S)
+    for it in range(t0 // BLOCK_S, last):
         offs_s = it * BLOCK_S + tl.arange(0, BLOCK_S)
         q = tl.load(q_ptr + base + offs_s[:, None] * D + offs_d[None, :])
         hub = tl.load(hub_ptr + base + offs_s[:, None] * D + offs_d[None, :])
@@ -232,7 +190,7 @@ def _moment_keys_kernel(q_ptr, k_ptr, v_ptr, hub_ptr, raw_ptr, sq_ptr, side_ptr,
         hub_out = tl.load(hubout_ptr + row * T + offs_s)
         logits = tl.dot(k, tl.trans(q)) * scale
         lag = offs_s[None, :] - offs_t[:, None]
-        a = tl.where(lag >= 0, tl.exp2((logits - lse[None, :]) * 1.4426950408889634), 0.0)
+        a = tl.where((lag >= 0) & (lag <= window), tl.exp2((logits - lse[None, :]) * 1.4426950408889634), 0.0)
         c = tl.dot(v, tl.trans(hub)) - hub_out[None, :]
         x = tl.load(side + offs_s[:, None] * D + offs_j[None, :]) * scale
         y = tl.load(side + offs_s[:, None] * D + (offs_j + J)[None, :]) * scale
@@ -248,6 +206,17 @@ def _moment_keys_kernel(q_ptr, k_ptr, v_ptr, hub_ptr, raw_ptr, sq_ptr, side_ptr,
         r2 += tl.dot(w2lb, f2)
         s1 += tl.sum(w1 * logits, axis=1)
         s2 += tl.sum(w2 * logits * logits, axis=1)
+    if blk % 2 == 1:
+        n = (row % BH) * T + offs_t
+        pos = n % M
+        head = ((row % BH) * T) // M
+        table = blk // 2
+        z = tl.load(Gates + (table * M + pos) * 8 + head).to(tl.float32)
+        # val rounded to bf16, the precision of the value sums this kernel stores.
+        gated = val.to(tl.bfloat16).to(tl.float32) * 2.0 * tl.sigmoid(z)[:, None]
+        dst = tl.load(Destinations + pos).to(tl.int32)
+        addr = Lexical + (((dst * 4 + table) * 8 + head) * D)[:, None] + offs_d[None, :]
+        tl.store(addr, gated)
     px, py = tl.split(tl.reshape(p2, (BLOCK_T, J, 2)))
     qx, qy = tl.split(tl.reshape(q2, (BLOCK_T, J, 2)))
     rx, ry = tl.split(tl.reshape(r2, (BLOCK_T, J, 2)))
@@ -266,14 +235,14 @@ def _moment_keys_kernel(q_ptr, k_ptr, v_ptr, hub_ptr, raw_ptr, sq_ptr, side_ptr,
 KEY_MOMENT_CONFIG = dict(BLOCK_T=64, BLOCK_S=32, num_warps=4, num_stages=3)  # the identity phase's key moments
 
 
-def moment_key_scores(q, k, v, hub, raw, sq, side, cos, sin, lse, hub_out, steps, out, values, repeat):
+def moment_key_scores(q, k, v, hub, raw, sq, side, cos, sin, lse, hub_out, steps, out, values, short_window, lexical):
     """The identity phase's key credits and value sums."""
     c = KEY_MOMENT_CONFIG
     rows, t, d = q.shape
     blocks = raw.shape[1]
-    assert repeat == 2 and d == 64, 'the identity phase\'s call (repeat = head_dim // 32)'
-    assert values.stride() == out.stride() and values.shape == out.shape
+    gates, destinations, lexical_out = lexical
     _moment_keys_kernel[(rows, t // c['BLOCK_T'])](q, k, v, hub, raw, sq, side, cos, sin, lse, hub_out, steps, out,
       values, rows // blocks, t, d ** -0.5, raw.stride(1), raw.stride(0), raw.stride(2), out.shape[2], out.stride(1),
-      out.stride(0), D=d, BLOCK_T=c['BLOCK_T'], BLOCK_S=c['BLOCK_S'], num_warps=c['num_warps'],
+      out.stride(0), D=d, BLOCK_T=c['BLOCK_T'], BLOCK_S=c['BLOCK_S'], SHORT_WINDOW=short_window,
+      Gates=gates, Destinations=destinations, Lexical=lexical_out, num_warps=c['num_warps'],
       num_stages=c['num_stages'])

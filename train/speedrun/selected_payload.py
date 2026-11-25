@@ -237,18 +237,19 @@ def _flat23(Index, K: tl.constexpr, B: tl.constexpr, I0, O0, S0_0: tl.constexpr,
 
 
 def launch(inputs, index, block=1024):
-    assert len(inputs) == 23
     k = index.numel()
     outputs = [z.new_empty((k, *z.shape[1:])) for z in inputs]
     args = [index, k, block]
     end = 0
     for z, out in zip(inputs, outputs):
-        assert 1 <= z.ndim <= 4
         dims = (*z.shape[1:], *((1,) * (4 - z.ndim)))
         strides = (*z.stride(), *((0,) * (4 - z.ndim)))
         size = math.prod(dims)
         end += triton.cdiv(k * size, block)
         args.extend((z, out, *strides, *dims, size, triton.next_power_of_2(size), end))
+    # The kernel takes 23 fields: each one beyond those given gets an empty grid range.
+    for _ in range(23 - len(inputs)):
+        args.extend((index, index, 1, 0, 0, 0, 1, 1, 1, 1, 1, end))
     _flat23[(end,)](*args, num_warps=4)
     return outputs
 
@@ -270,7 +271,6 @@ def selected_payload(mids, xL, routes, signed_steps, base, target_w, y, moments,
     yy = put(y)
     mm = [put(z) for z in moments]
     ct = put(control, True)
-    assert len(fields) == 23
     chosen = launch(fields, inside)
     def get(i):
         return None if i is None else chosen[i]

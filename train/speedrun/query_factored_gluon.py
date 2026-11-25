@@ -213,30 +213,6 @@ def interleave_wq(w_q, heads):
 FACTOR_CONFIG = dict(BM=128, BN=256, BK=64, num_warps=8, num_stages=3)
 
 
-@torch.library.custom_op('visit_kernel::query_factors_table', mutates_args=())
-def query_factors_table(wo: torch.Tensor, routes: torch.Tensor, basis: torch.Tensor,
-    w_q: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Full bf16 factor product and frame projection; routed rows are gathered inside the replay."""
-    c = w_q.shape[0]
-    wq = interleave_wq(w_q, c // 64)
-    n, r = routes.shape
-    rows, d = wo.shape
-    cfg = dict(FACTOR_CONFIG)
-    assert c % cfg['BN'] == 0
-    prod = torch.empty((rows, c, 1), device=wo.device, dtype=torch.bfloat16)  # (Wo @ wq^T) as At with R = 1
-    every = torch.arange(rows, device=wo.device, dtype=routes.dtype)
-    _factor_at_kernel[(triton.cdiv(rows, cfg['BM']), c // cfg['BN'])](wo.contiguous(), every, wq, prod, rows, c, d, 1,
-      **cfg)
-    f = (basis.float() @ wq.float().T).to(torch.bfloat16)
-    return prod.view(rows, c), f
-
-
-@query_factors_table.register_fake
-def _(wo, routes, basis, w_q):
-    return (torch.empty((wo.shape[0], w_q.shape[0]), device=wo.device, dtype=torch.bfloat16),
-      torch.empty((basis.shape[0], w_q.shape[0]), device=wo.device, dtype=torch.bfloat16))
-
-
 @torch.library.custom_op('visit_kernel::fused_query_replay_factored_rot', mutates_args=())
 def fused_query_replay_factored_rot(change: torch.Tensor, steps: torch.Tensor, scale: torch.Tensor,
     at: torch.Tensor, f: torch.Tensor, r0: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, inv: torch.Tensor,
@@ -248,8 +224,6 @@ def fused_query_replay_factored_rot(change: torch.Tensor, steps: torch.Tensor, s
     c = heads * width
     cfg = dict(ROT_CONFIG)
     bm = cfg.pop('BM')
-    assert p % bm == 0 and width == 64 and heads % 2 == 0 and at.ndim == 2 and at.shape[1] == c and routes.shape == (n,
-        r) and f.shape == (p, c)
     f32 = lambda z: z.float().contiguous()
     kr = torch.empty((n, heads, 2 * count + 2, width), device=change.device, dtype=torch.bfloat16)
     rk = torch.empty((n, heads, count), device=change.device, dtype=torch.float32)

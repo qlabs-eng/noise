@@ -93,8 +93,7 @@ class AdamGraphs:
         warn = torch.is_deterministic_algorithms_warn_only_enabled()
         try:
             torch.use_deterministic_algorithms(True)
-            for packed in packed_buffers:
-                wire = packed[1]
+            for wire in packed_buffers:
                 if wire.data_ptr() in self.graphs:
                     continue
                 original_wire = wire.clone()

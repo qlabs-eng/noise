@@ -1,4 +1,3 @@
-import torch
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 from triton.experimental.gluon.language.nvidia.hopper import (
@@ -81,11 +80,9 @@ def _raw_kernel(k_desc, q_desc, h_desc, lse_desc, Out,
     gl.store(Out + start + rows[:, None].to(gl.int64) * OUT_H * 64 + dims[None, :], raw64)
 
 
-def raw_values(q, k, lse, hub, window, heads):
+def raw_values(q, k, lse, hub, window, heads, out):
     h, t, d = q.shape
-    assert d == 64 and all(z.dtype == torch.bfloat16 for z in (q, k, hub))
     bt, bs, stages = 64, 32, 2
-    out = torch.empty((h // heads, t, heads * d), device=q.device, dtype=torch.float32)
     kl = gl.NVMMASharedLayout.get_default_for([bt, d], gl.bfloat16)
     ql = gl.NVMMASharedLayout.get_default_for([bs, d], gl.bfloat16)
     kd = TensorDescriptor.from_tensor(k.contiguous().view(h * t, d), [bt, d], kl)
@@ -95,4 +92,3 @@ def raw_values(q, k, lse, hub, window, heads):
               gl.NVMMASharedLayout(swizzle_byte_width=0, element_bitwidth=32, rank=2))
     _raw_kernel[(h, t // bt)](kd, qd, hd, ld, out, T=t, Window=window,
                             BT=bt, BS=bs, STAGES=stages, OUT_H=heads, num_warps=4)
-    return out

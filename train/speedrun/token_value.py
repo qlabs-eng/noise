@@ -1,15 +1,6 @@
-"""Gluon (Hopper) value credit pass: sum_s p(s, t) * source(s) (the window's attention
-probabilities of query s on key t times the source rows: bf16 queries and keys, bf16 probabilities times the source's
-bf16 high part, fp32 accumulation), as an FA3-style kernel.
-
-CTA = 128 keys (two warpgroups, 64 each) of one head; the receiver blocks (64 queries) of its window stream through a
-TMA ring shared by both warpgroups: the queries (as two 32-column halves), the source's bf16 high part (formed once
-per call by _split_kernel) and the receivers' lse row. Per block: S = keys @ queries^T (wgmma from shared memory),
-P = exp(S / 8 - lse) (masked only on the window's edge blocks), O += P @ high (P from registers).
-"""
+"""The Cut's value credit pass as a Gluon (Hopper) kernel: each key's sum over its window's queries of attention
+probability times the source row, with the gated credits of the value tables added per vocabulary row."""
 import torch
-import triton
-import triton.language as tl
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 from triton.experimental.gluon.language.nvidia.hopper import (
@@ -20,38 +11,28 @@ CONFIG = dict(BT=128, BS=64, STAGES=2)
 LOG2E = gl.constexpr(1.4426950408889634)
 
 
-@triton.jit
-def _split_kernel(Src, Hi, T: tl.constexpr, IN_H: tl.constexpr, IN_LAYER, IN_TOKEN, BLOCK: tl.constexpr):
-    """Hi (rows, T, 64) bf16: each source row's bf16 high part; the source stacked or by token (IN_H heads of a
-    layer side by side, strides IN_LAYER, IN_TOKEN)."""
-    row, tile = tl.program_id(0), tl.program_id(1)
-    token = tile * BLOCK + tl.arange(0, BLOCK)
-    dims = tl.arange(0, 64)
-    x = tl.load(Src + (row // IN_H).to(tl.int64) * IN_LAYER + (row % IN_H) * 64 + token[:, None] * IN_TOKEN
-                + dims[None, :])
-    hi = x.to(tl.bfloat16)
-    dst = row.to(tl.int64) * T * 64 + token[:, None] * 64 + dims[None, :]
-    tl.store(Hi + dst, hi)
-
-
 @gluon.jit
-def _issue(q_desc, h_desc, bar, qsm, hsm, slot, row, pred, BS: gl.constexpr, lse_desc=None, lsesm=None):
+def _issue(q_desc, h_desc, bar, qsm, hsm, slot, row, source_row, column, pred, BS: gl.constexpr,
+           lse_desc, lsesm):
     mbarrier.expect(bar.index(slot), BS * 64 * 2 + BS * 64 * 2 + BS * 4, pred=pred)
     # the row of BS receivers' lse ((h T / BS, BS) view)
     tma.async_copy_global_to_shared(lse_desc, [row // BS, 0], bar.index(slot), lsesm.index(slot), pred=pred)
     tma.async_copy_global_to_shared(q_desc, [row, 0], bar.index(slot), qsm.index(2 * slot), pred=pred)
     tma.async_copy_global_to_shared(q_desc, [row, 32], bar.index(slot), qsm.index(2 * slot + 1), pred=pred)
-    tma.async_copy_global_to_shared(h_desc, [row, 0], bar.index(slot), hsm.index(slot), pred=pred)
+    tma.async_copy_global_to_shared(h_desc, [source_row, column], bar.index(slot), hsm.index(slot), pred=pred)
 
 
 @gluon.jit
 def _value_gluon_kernel(k_desc, q_desc, h_desc, Out, OutMap, OUT_LAYER, OUT_TOKEN, lse_desc,
     T: gl.constexpr, Window: gl.constexpr, BT: gl.constexpr, BS: gl.constexpr, STAGES: gl.constexpr,
-    OUT_H: gl.constexpr, num_warps: gl.constexpr):
+    OUT_H: gl.constexpr, num_warps: gl.constexpr,
+    Gates, Ids, Lexical, ROWS: gl.constexpr, VOCAB: gl.constexpr):
     head = gl.program_id(0)
     tile = gl.program_id(1)
     t0 = tile * BT
     base = head * T
+    source_base = gl.load(OutMap + head // OUT_H) * T
+    source_column = (head % OUT_H) * 64
     ksm = gl.allocate_shared_memory(gl.bfloat16, [2, BT, 32], k_desc.layout)
     qsm = gl.allocate_shared_memory(gl.bfloat16, [2 * STAGES, BS, 32], q_desc.layout)
     hsm = gl.allocate_shared_memory(gl.bfloat16, [STAGES, BS, 64], h_desc.layout)
@@ -67,8 +48,8 @@ def _value_gluon_kernel(k_desc, q_desc, h_desc, Out, OutMap, OUT_LAYER, OUT_TOKE
     tma.async_copy_global_to_shared(k_desc, [base + t0, 0], kbar, ksm.index(0))
     tma.async_copy_global_to_shared(k_desc, [base + t0, 32], kbar, ksm.index(1))
     for i in gl.static_range(STAGES - 1):
-        _issue(q_desc, h_desc, bar, qsm, hsm, i, base + (first + i) * BS, first + i < last, BS, lse_desc,
-          lsesm)
+        _issue(q_desc, h_desc, bar, qsm, hsm, i, base + (first + i) * BS,
+               source_base + (first + i) * BS, source_column, first + i < last, BS, lse_desc, lsesm)
 
     mma_s: gl.constexpr = gl.NVMMADistributedLayout(version=[3, 0], warps_per_cta=[num_warps, 1],
       instr_shape=[16, BS, 16])
@@ -86,11 +67,11 @@ def _value_gluon_kernel(k_desc, q_desc, h_desc, Out, OutMap, OUT_LAYER, OUT_TOKE
         # every warp is done with the slot refilled now (its previous block's wgmmas were waited)
         gl.thread_barrier()
         nxt = it + STAGES - 1
-        _issue(q_desc, h_desc, bar, qsm, hsm, (n + STAGES - 1) % STAGES, base + nxt * BS, nxt < last,
-          BS, lse_desc, lsesm)
+        _issue(q_desc, h_desc, bar, qsm, hsm, (n + STAGES - 1) % STAGES, base + nxt * BS,
+               source_base + nxt * BS, source_column, nxt < last, BS, lse_desc, lsesm)
         mbarrier.wait(bar.index(slot), (n // STAGES) & 1)
         s = warpgroup_mma(ksm.index(0), qsm.index(2 * slot).permute((1, 0)), zero_s, use_acc=False,
-          is_async=True)  # fp32 operands: tf32 (the default input precision)
+          is_async=True)
         s = warpgroup_mma(ksm.index(1), qsm.index(2 * slot + 1).permute((1, 0)), s, is_async=True)
         receiver = it * BS + cols
         lse = lsesm._reinterpret(gl.float32, [STAGES, BS], gl.SwizzledSharedLayout(1, 1, 1, [0])).index(
@@ -117,27 +98,41 @@ def _value_gluon_kernel(k_desc, q_desc, h_desc, Out, OutMap, OUT_LAYER, OUT_TOKE
     dims = gl.arange(0, 64, gl.SliceLayout(0, mma_o))
     gl.store(Out + start + rows[:, None].to(gl.int64) * OUT_TOKEN + dims[None, :], acc)
 
+    physical_layer = layer // ROWS
+    if physical_layer % 2 == 1:
+        table = physical_layer // 2
+        token = (layer % ROWS) * T + rows
+        h = head % OUT_H
+        gated_row = table * (ROWS * T) + token
+        z = gl.load(Gates + gated_row * OUT_H + h).to(gl.float32)
+        gate = 2.0 * (1.0 / (1.0 + gl.exp(-z)))
+        contribution = acc * gate[:, None]
+        ids = gl.load(Ids + token).to(gl.int32)
+        dest = table * VOCAB + ids
+        offset = (dest[:, None] * OUT_H + h) * 64 + dims[None, :]
+        gl.atomic_add(Lexical + offset, contribution, sem='relaxed')
 
-def value_pass_gluon(q, k, lse, source, window, out, layers):
-    """sum_s p * source for (rows, T, 64) bf16 q / k, the rows heads of rows // heads layers: source and out are
-    (layers, T, heads * 64) views with last stride 1, source indexed by the rows' layers and out at the index
-    layers (int32) gives each of them."""
-    h, t, d = q.shape
-    heads = source.shape[-1] // d
-    assert d == 64 and source.shape[-1] // heads == 64 and source.stride(2) == 1
+
+def transport(q, k, lse, source, window, out, layers, lexical):
+    h, t, width = q.shape
+    heads = source.shape[-1] // width
     bt, bs = CONFIG['BT'], CONFIG['BS']
-    assert out.stride(2) == 1 and t % bt == 0 and t % bs == 0
-    hi = torch.empty((h, t, 64), device=q.device, dtype=torch.bfloat16)
-    _split_kernel[(h, t // 64)](source, hi, T=t, IN_H=heads, IN_LAYER=source.stride(0),
-      IN_TOKEN=source.stride(1), BLOCK=64, num_warps=4)
-    assert q.dtype == torch.bfloat16 and layers is not None
-    q2, k2 = q.contiguous().view(h * t, 64), k.contiguous().view(h * t, 64)
-    k_desc = TensorDescriptor.from_tensor(k2, [bt, 32], gl.NVMMASharedLayout.get_default_for([bt, 32], gl.bfloat16))
-    q_desc = TensorDescriptor.from_tensor(q2, [bs, 32], gl.NVMMASharedLayout.get_default_for([bs, 32], gl.bfloat16))
-    hl = gl.NVMMASharedLayout.get_default_for([bs, 64], gl.bfloat16)
-    h_desc = TensorDescriptor.from_tensor(hi.view(h * t, 64), [bs, 64], hl)
-    lse_desc = TensorDescriptor.from_tensor(lse.contiguous().view(h * t // bs, bs), [1, bs],
-      gl.NVMMASharedLayout(swizzle_byte_width=0, element_bitwidth=32, rank=2))
-    _value_gluon_kernel[(h, t // bt)](k_desc, q_desc, h_desc, out,
-      layers, out.stride(0), out.stride(1), lse_desc, T=t, Window=window, BT=bt, BS=bs,
-      STAGES=CONFIG['STAGES'], OUT_H=heads, num_warps=bt // 16)
+    def desc(tensor, shape, dtype):
+        return TensorDescriptor.from_tensor(tensor, shape, gl.NVMMASharedLayout.get_default_for(shape, dtype))
+    kd = desc(k.contiguous().view(-1, 64), [bt, 32], gl.bfloat16)
+    qd = desc(q.contiguous().view(-1, 64), [bs, 32], gl.bfloat16)
+    hd = desc(source.view(-1, heads * width), [bs, 64], gl.bfloat16)
+    ld = TensorDescriptor.from_tensor(lse.contiguous().view(-1, bs), [1, bs],
+        gl.NVMMASharedLayout(swizzle_byte_width=0, element_bitwidth=32, rank=2))
+    gates, ids, destination = lexical
+    rows = ids.shape[0]
+    size = destination.shape[1]
+    _value_gluon_kernel[(h, t // bt)](kd, qd, hd, out, layers, out.stride(0), out.stride(1), ld,
+        T=t, Window=window, BT=bt, BS=bs, STAGES=CONFIG['STAGES'], OUT_H=heads, num_warps=bt // 16,
+        Gates=gates, Ids=ids, Lexical=destination, ROWS=rows, VOCAB=size)
+
+
+def lexical_storage(ids, gate_values, vocab, width):
+    gates = torch.stack(gate_values)
+    destination = torch.zeros((4, vocab, width), device=ids.device, dtype=torch.float32)
+    return gates, ids, destination
